@@ -704,6 +704,8 @@ class Attempt:
     def describe(self) -> str:
         if self.preset.lossless:
             return "lossless cleanup only"
+        if self.images_downsampled == 0:
+            return "structure cleanup only (no image needed re-encoding)"
         return self.preset.describe()
 
 
@@ -858,7 +860,16 @@ def shrink_to_target(
         # Rung 1: lossless structural cleanup. Always worth measuring — it costs
         # nothing in quality and sometimes lands inside the target on its own.
         lossless = run(PRESETS[0])
+        shrinkable = sum(
+            1
+            for record in inspection.images.values()
+            if record.decodable and record.raw_bytes >= 16_000
+        )
         if lossless.bytes <= target_bytes:
+            chosen = lossless
+        elif shrinkable == 0:
+            # Nothing in here is an image we could re-encode: walking the ladder
+            # would rebuild the same file six times and prove nothing.
             chosen = lossless
         else:
             ladder = list(AGGRESSIVE_LADDER if aggressive else SAFE_LADDER)

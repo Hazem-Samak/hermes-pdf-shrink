@@ -109,6 +109,10 @@ def _short_sha(digest: str) -> str:
     return digest[:12] if digest else ""
 
 
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
 def _suggest_target(floor_bytes: int) -> str:
     """A round number just above the honest floor, for the 'raise it to' hint."""
     engine = _engine()
@@ -122,7 +126,7 @@ def _suggest_target(floor_bytes: int) -> str:
 def _describe_attempt(engine, attempt) -> dict:
     return {
         "preset": attempt.preset.name,
-        "quality": attempt.preset.describe(),
+        "quality": attempt.describe(),
         "size": engine.human_size(attempt.bytes),
         "bytes": attempt.bytes,
         "images_downsampled": attempt.images_downsampled,
@@ -262,14 +266,25 @@ def _verdict(engine, report):
             advice,
         )
 
-    if image_share < 0.2 and report.fonts > 0:
+    if image_share < 0.2 or len(report.images) == 0:
+        if not report.images:
+            headline = (
+                f"No images at all: this file is {report.pages} page(s) of "
+                f"{'text and fonts' if report.fonts else 'vector drawing'}, "
+                f"plus structure."
+            )
+        else:
+            headline = (
+                f"Only {image_share * 100:.0f}% of this file is images — the page "
+                f"content itself ({report.fonts} font(s), vector drawing) is what "
+                "you are carrying."
+            )
         return (
             "vector_or_text",
-            f"Only {image_share * 100:.0f}% of this file is images — the page "
-            f"content itself ({report.fonts} font(s), vector drawing) is what you "
-            "are carrying.",
+            headline,
             "Re-encoding images would barely move the number, so pdf_shrink will "
-            "report that the target is out of reach rather than degrade the file.",
+            "still do a lossless structure pass and then report that the target is "
+            "out of reach rather than degrade the file.",
         )
 
     return (
@@ -420,8 +435,8 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
             "no image was re-encoded (structure cleanup only)"
             if chosen is not None and chosen.preset.lossless
             else (
-                f"{chosen.images_downsampled} image(s) re-encoded at "
-                f"{chosen.preset.describe()}"
+                f"{_plural(chosen.images_downsampled, 'image')} re-encoded at "
+                f"{chosen.describe()}"
                 if chosen is not None
                 else "no image was re-encoded"
             )
@@ -432,9 +447,10 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
             f"{images}. Original untouched (sha-256 checked)."
         )
         if verified["reopens"]:
+            blank = verified["blank_pages"]
             message += (
                 f" Re-opened the copy: {verified['pages']} pages, "
-                f"{verified['blank_pages']} blank."
+                f"{'none blank' if not blank else str(blank) + ' blank'}."
             )
         return {
             "ok": True,
@@ -450,7 +466,7 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
             "pages": result.pages,
             "quality": None if result.chosen is None else {
                 "preset": result.chosen.preset.name,
-                "description": result.chosen.preset.describe(),
+                "description": result.chosen.describe(),
                 "images_downsampled": result.chosen.images_downsampled,
                 "images_skipped": result.chosen.images_skipped,
             },
@@ -484,9 +500,9 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
             ],
         }
 
+    suggested = _suggest_target(result.output_bytes)
     suggestions = [
-        f"Raise the target to about {_suggest_target(result.output_bytes)} and keep "
-        "this quality.",
+        f"Raise the target to about {suggested} and keep this quality.",
     ]
     if not result.aggressive:
         suggestions.append(
@@ -495,12 +511,15 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
     message = (
         f"I could not get this under {target['size']} without making it "
         f"unreadable. The smallest safe copy is {output['size']} "
-        f"({floor.preset.describe()}) — saved as {output['name']}. "
+        f"({floor.describe()}) — saved as {output['name']}. "
         f"That is {result.saved_percent:.1f}% smaller than the original, which is "
-        f"untouched. To go lower: {suggestions[0].lower()}"
+        f"untouched. To go lower, raise the target to about {suggested}"
     )
-    if not result.aggressive:
-        message += " Or allow aggressive quality."
+    message += (
+        ", or call again with aggressive=true for 72 DPI."
+        if not result.aggressive
+        else "."
+    )
 
     return {
         "ok": False,
@@ -511,13 +530,13 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
         "smallest_safe": {
             "size": output["size"],
             "bytes": result.output_bytes,
-            "quality": floor.preset.describe(),
+            "quality": floor.describe(),
             "preset": floor.preset.name,
         },
         "pages": result.pages,
         "quality": {
             "preset": floor.preset.name,
-            "description": floor.preset.describe(),
+            "description": floor.describe(),
             "images_downsampled": floor.images_downsampled,
             "images_skipped": floor.images_skipped,
         },
@@ -541,7 +560,7 @@ def _render_preview(engine, result, output_path: Path) -> str | None:
         )
         chosen = result.chosen
         caption = (
-            f"{result.pages} pages · {chosen.preset.describe()}"
+            f"{result.pages} pages · {chosen.describe()}"
             if chosen is not None
             else f"{result.pages} pages"
         )

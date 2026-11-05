@@ -111,6 +111,17 @@ No network calls, no telemetry, no subprocess. The plugin reads the PDF you poin
 it at, writes one file next to it (or wherever you ask), and stores its preview
 images under the Hermes plugin data directory. That is the whole footprint.
 
+**Disclosure.** `pdf_shrink` reads the PDF you name and writes one new `.pdf`
+(beside the original by default, or at `output_path`); it never writes to the
+input, and it re-hashes the input afterwards to prove it. `pdf_inspect` only
+reads. Comparison images are written to
+`<HERMES_HOME>/plugin-data/pdf-shrink/previews/`. Files are re-encoded with
+pikepdf/PDFium and the result is re-opened to verify the page count — a copy that
+cannot be verified is reported as failed, not handed over as a success. Nothing
+leaves the machine: no network, no subprocess, no credentials, no telemetry. The
+only destructive option is `drop_attachments=true`, which removes files embedded
+inside the PDF and is off by default.
+
 ## Licence
 
 MIT. Bundled third-party libraries keep their own licences: pikepdf (MPL-2.0),
