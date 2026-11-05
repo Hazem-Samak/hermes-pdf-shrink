@@ -11,7 +11,9 @@ PDF_SHRINK = {
         "unreadable, the tool says so, reports the smallest safe size, and "
         "saves that copy instead of ruining the document. Returns JSON with the "
         "output path, before/after sizes, the quality used, and a message ready "
-        "to show the user."
+        "to show the user. When the JSON carries a 'preview_image' path, put that "
+        "path in your reply on its own line as MEDIA:<path> so the user sees the "
+        "before/after comparison."
     ),
     "parameters": {
         "type": "object",
