@@ -78,18 +78,70 @@ def render_page(path: Path, page_index: int = 0, dpi: int = _PAGE_DPI):
         document.close()
 
 
-def _detail_strip(page_image, width: int):
+def _line_runs(crop):
+    """Row ranges that contain ink, grouped into text lines."""
+    from PIL import Image
+
+    rows = crop.convert("L").resize((1, crop.height), Image.BOX)
+    brightness = list(rows.getdata())
+    if not brightness:
+        return []
+    paper = max(brightness)
+    ink = [value < paper - 22 for value in brightness]
+
+    runs = []
+    index = 0
+    height = len(ink)
+    while index < height:
+        if ink[index]:
+            start = index
+            gap = 0
+            while index < height and gap < 3:  # small gaps stay inside one line
+                if ink[index]:
+                    gap = 0
+                else:
+                    gap += 1
+                index += 1
+            runs.append((start, max(start + 1, index - gap)))
+        else:
+            index += 1
+    return runs
+
+
+def _detail_box(page_image, top_fraction: float = 0.30,
+                height_fraction: float = 0.11, width_fraction: float = 0.52):
+    """Bounding box for the zoom strip, snapped so it holds whole text lines."""
+    width, height = page_image.size
+    box = (0, int(height * top_fraction),
+           int(width * width_fraction), int(height * (top_fraction + height_fraction)))
+    try:
+        band = page_image.crop(box)
+        runs = _line_runs(band)
+        # Only lines that sit wholly inside the band may survive, so a sliver at
+        # either edge is dropped instead of half-shown.
+        kept = [run for run in runs if run[0] >= 2 and run[1] <= band.height - 2]
+        if len(kept) >= 2:
+            first_start = kept[0][0]
+            last_end = kept[-1][1]
+            next_ink = next((run[0] for run in runs if run[0] > last_end), None)
+            top = max(0, first_start - 8)
+            bottom = (
+                min(band.height, (last_end + next_ink) // 2)
+                if next_ink is not None
+                else min(band.height, last_end + 8)
+            )
+            if bottom - top > 40:
+                return (box[0], box[1] + top, box[2], box[1] + bottom)
+    except Exception:  # noqa: BLE001 - cosmetic only
+        pass
+    return box
+
+
+def _detail_strip(page_image, width: int, box=None):
     """A 2.4x zoom of a text-dense band, so quality loss is visible."""
     from PIL import Image
 
-    w, h = page_image.size
-    box = (
-        0,
-        int(h * 0.30),
-        int(w * 0.52),
-        int(h * 0.41),
-    )
-    crop = page_image.crop(box)
+    crop = page_image.crop(box or _detail_box(page_image))
     ratio = width / crop.width
     return crop.resize((width, int(crop.height * ratio)), Image.LANCZOS)
 
@@ -119,7 +171,10 @@ def comparison_sheet(
     for image in (before, after):
         ratio = _PANEL_WIDTH / image.width
         panels.append(image.resize((_PANEL_WIDTH, int(image.height * ratio)), Image.LANCZOS))
-    strips = [_detail_strip(image, _PANEL_WIDTH) for image in (before, after)]
+    strips = []
+    detail_box = _detail_box(before)
+    for image in (before, after):
+        strips.append(_detail_strip(image, _PANEL_WIDTH, detail_box))
 
     columns = [
         (panels[0], strips[0], "BEFORE", original_label),
