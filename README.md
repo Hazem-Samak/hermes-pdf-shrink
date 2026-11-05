@@ -61,6 +61,14 @@ Ask in plain language:
 
 ## Install
 
+From the repository (works today):
+
+```
+hermes plugins install Hazem-Samak/hermes-pdf-shrink --yes-deps
+```
+
+From the catalog, once the entry is merged:
+
 ```
 hermes plugins install pdf-shrink
 ```
@@ -70,6 +78,7 @@ Local development:
 ```
 hermes plugins doctor /path/to/pdf-shrink --ci     # structure + contracts
 hermes plugins validate /path/to/pdf-shrink --install-deps   # catalog CI gate
+python -m pytest tests -q                         # 30 tests, no fixtures
 ```
 
 Dependencies (installed by Hermes when you enable the plugin): `pikepdf` for
