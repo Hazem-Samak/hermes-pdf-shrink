@@ -131,6 +131,8 @@ searchable.
   the source folder, then the current working directory; an explicit
   `output_path` is used as given. If none can be written, the call returns
   `destination_not_writable` instead of a traceback.
+- **Temp space.** Rungs are built in the system temp directory, which honours
+  `TMPDIR`. For a very large PDF, point `TMPDIR` at a filesystem with room.
 - **No OCR, no page splitting, no password removal.** It refuses
   password-protected files with a clear message rather than pretending.
 - **Attachments are kept** unless you pass `drop_attachments=true`, because those
