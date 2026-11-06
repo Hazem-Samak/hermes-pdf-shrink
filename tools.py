@@ -113,6 +113,15 @@ def _plural(count: int, word: str) -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
+def _saved_label(output: dict, original: dict) -> str:
+    """Name the output; include its folder when it is not beside the source."""
+    out_path = Path(output["path"])
+    source_path = Path(original["path"])
+    if out_path.parent == source_path.parent:
+        return output["name"]
+    return output["path"]
+
+
 def _suggest_target(floor_bytes: int, source_bytes: int) -> str | None:
     """A reachable round target above the honest floor, or None.
 
@@ -410,6 +419,13 @@ def pdf_shrink(args: dict, **kwargs) -> str:
             "the original — pick another name.",
             path=str(path),
         )
+    except engine.DestinationNotWritable as exc:
+        return _fail(
+            "destination_not_writable",
+            f"{exc}. Nothing was written and the original was not written to.",
+            path=str(path),
+            output_path=str(destination) if destination else None,
+        )
     except Exception as exc:  # noqa: BLE001
         name = type(exc).__name__
         if name == "PasswordError" or "password" in str(exc).lower():
@@ -508,7 +524,7 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
         )
         if output is not None:
             message += (
-                f" The copy at {output['name']} was built from the original I "
+                f" The copy at {_saved_label(output, original)} was built from the original I "
                 "opened at the start; re-check it before using it."
             )
         else:
@@ -537,7 +553,7 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
         detail = f" ({detail})" if detail else ""
         if output is not None:
             message = (
-                f"I wrote {output['size']} to {output['name']}, but it failed the "
+                f"I wrote {output['size']} to {_saved_label(output, original)}, but it failed the "
                 f"re-open check{detail}. Do not rely on that copy. The original "
                 "is untouched."
             )
@@ -579,7 +595,7 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
             images = "no image was re-encoded"
         message = (
             f"{original['size']} → {output['size']} "
-            f"({result.saved_percent:.1f}% smaller). Saved as {output['name']}. "
+            f"({result.saved_percent:.1f}% smaller). Saved as {_saved_label(output, original)}. "
             f"{images}. Original untouched (sha-256 checked)."
         )
         if verified["reopens"]:
@@ -711,7 +727,7 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
         )
     message = (
         f"{opening} The smallest safe copy is {output['size']} "
-        f"({floor.describe()}) — saved as {output['name']}. "
+        f"({floor.describe()}) — saved as {_saved_label(output, original)}. "
         f"That is {result.saved_percent:.1f}% smaller than the original, which is "
         "untouched."
     )

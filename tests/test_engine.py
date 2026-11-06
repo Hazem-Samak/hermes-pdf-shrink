@@ -9,7 +9,9 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sys
+import tempfile
 import zlib
 from pathlib import Path
 
@@ -357,6 +359,106 @@ def test_default_destination_never_collides(tmp_path):
 # --------------------------------------------------------------------------- #
 # Safety regressions
 # --------------------------------------------------------------------------- #
+
+POSIX_PERMISSIONS = pytest.mark.skipif(
+    sys.platform == "win32"
+    or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX permissions and a non-root user",
+)
+
+
+def test_work_files_live_in_system_temp_and_are_cleaned(tmp_path, monkeypatch):
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(work_root))
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    source = make_pdf(docs / "scan.pdf", pages=1)
+
+    seen = []
+    original = engine._save
+
+    def recording(pdf, destination, preset, drop_attachments):
+        seen.append(Path(destination))
+        return original(pdf, destination, preset, drop_attachments)
+
+    monkeypatch.setattr(engine, "_save", recording)
+    result = engine.shrink_to_target(
+        source, source.stat().st_size // 2, destination=tmp_path / "out.pdf"
+    )
+
+    assert result.ok, result.reason
+    assert seen
+    assert all(path.parent.parent == work_root for path in seen)
+    assert list(work_root.iterdir()) == []
+    assert [path.name for path in docs.iterdir()] == ["scan.pdf"]
+
+
+@POSIX_PERMISSIONS
+def test_read_only_source_folder_with_explicit_output(tmp_path):
+    docs = tmp_path / "readonly"
+    docs.mkdir()
+    source = make_pdf(docs / "scan.pdf", pages=1)
+    output = tmp_path / "out.pdf"
+
+    docs.chmod(0o555)
+    try:
+        result = engine.shrink_to_target(
+            source, source.stat().st_size // 2, destination=output
+        )
+    finally:
+        docs.chmod(0o755)
+
+    assert result.ok, result.reason
+    assert result.output == output.resolve()
+    assert [path.name for path in docs.iterdir()] == ["scan.pdf"]
+
+
+@POSIX_PERMISSIONS
+def test_read_only_source_folder_falls_back_to_cwd(tmp_path, monkeypatch):
+    docs = tmp_path / "readonly"
+    docs.mkdir()
+    source = make_pdf(docs / "scan.pdf", pages=1)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    docs.chmod(0o555)
+    try:
+        result = engine.shrink_to_target(source, source.stat().st_size // 2)
+    finally:
+        docs.chmod(0o755)
+
+    assert result.ok, result.reason
+    assert result.output == (cwd / "scan-compressed.pdf").resolve()
+    assert [path.name for path in docs.iterdir()] == ["scan.pdf"]
+
+
+@POSIX_PERMISSIONS
+def test_unwritable_destination_is_reported(tmp_path, plugin):
+    source = make_pdf(tmp_path / "scan.pdf", pages=1)
+    destination_dir = tmp_path / "no-write"
+    destination_dir.mkdir()
+
+    destination_dir.chmod(0o555)
+    try:
+        payload = json.loads(
+            plugin.tools.pdf_shrink(
+                {
+                    "path": str(source),
+                    "target_size": "500 KB",
+                    "output_path": str(destination_dir / "out.pdf"),
+                    "show_preview": False,
+                }
+            )
+        )
+    finally:
+        destination_dir.chmod(0o755)
+
+    assert payload["status"] == "destination_not_writable"
+    assert "output_path" in payload["message"]
+    assert list(destination_dir.iterdir()) == []
 
 
 def test_existing_destination_is_never_overwritten(tmp_path):

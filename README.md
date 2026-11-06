@@ -13,7 +13,10 @@ original untouched · copy re-opened and checked · ~3 s
 
 Every run writes a **new** file. If the named output already exists, the tool
 refuses rather than replacing it; the original is hashed before and after and the
-result is reported even when that check fails.
+result is reported even when that check fails. Ladder rungs are built in a
+private system-temp directory and deleted, never beside your PDF. If the source
+folder is read-only, the default copy goes to the current working directory and
+the reported path says where; pass `output_path` to choose.
 
 ## Why another PDF compressor
 
@@ -83,7 +86,7 @@ Local development:
 ```
 hermes plugins doctor /path/to/pdf-shrink --ci     # structure + contracts
 hermes plugins validate /path/to/pdf-shrink --install-deps   # catalog CI gate
-python -m pytest tests -q                         # 44 tests, no fixtures
+python -m pytest tests -q                         # 48 tests, no fixtures
 scripts/build_demo.sh                             # regenerate demo + catalog assets
 ```
 
@@ -123,6 +126,11 @@ searchable.
 - **It never overwrites a file.** The default name gets a numeric suffix if it
   already exists; an explicit `output_path` that exists is refused with
   `destination_exists`.
+- **A read-only source folder is fine.** Temporary rungs live in the system temp
+  directory (0700) and are removed on every exit path. The default output tries
+  the source folder, then the current working directory; an explicit
+  `output_path` is used as given. If none can be written, the call returns
+  `destination_not_writable` instead of a traceback.
 - **No OCR, no page splitting, no password removal.** It refuses
   password-protected files with a clear message rather than pretending.
 - **Attachments are kept** unless you pass `drop_attachments=true`, because those
@@ -133,13 +141,18 @@ searchable.
 ## Privacy
 
 No network calls, no telemetry, no subprocess. The plugin reads the PDF you point
-it at, writes one file next to it (or wherever you ask), and stores its preview
-images under the Hermes plugin data directory. That is the whole footprint.
+it at, writes one new file (beside it when that folder is writable, otherwise in
+the current working directory or wherever `output_path` says), and stores its
+preview images under the Hermes plugin data directory. Full-size ladder rungs are
+written to a private system-temp directory and removed before the call returns;
+nothing is left beside the PDF. That is the whole footprint.
 
 **Disclosure.** `pdf_shrink` reads the PDF you name and writes one new `.pdf`
-(beside the original by default, or at `output_path`); it never writes to the
-input, it refuses to replace an existing file, and it re-hashes the input
-afterwards to prove it. `pdf_inspect` only reads. Comparison images are written to
+(beside the original when that folder is writable, otherwise in the current
+working directory, or at `output_path`); it never writes to the input, it refuses
+to replace an existing file, and it re-hashes the input afterwards to prove it.
+Temporary rungs are written to the system temp directory and deleted.
+`pdf_inspect` only reads. Comparison images are written to
 `<HERMES_HOME>/plugin-data/pdf-shrink/previews/`. Files are re-encoded with
 pikepdf/PDFium and the result is re-opened to verify the page count, blank pages
 and structural syntax — a copy that cannot be verified is reported as failed, not

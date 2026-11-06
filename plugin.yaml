@@ -1,6 +1,6 @@
 name: pdf-shrink
 label: PDF Shrink
-version: 1.0.1
+version: 1.0.2
 manifest_version: 2
 author: Hazem Samak
 license: MIT
@@ -15,7 +15,10 @@ description: >-
   it says so, reports the smallest safe size, and saves the best safe copy when
   it is meaningfully smaller instead of degrading the document. Includes a
   before/after preview image when PDFium is available, and a size breakdown of
-  what makes a PDF heavy.
+  what makes a PDF heavy. Works with read-only source folders: full-size ladder
+  rungs are built in the system temp directory, never beside the PDF, and the
+  default output falls back to the current directory when the source folder
+  cannot be written.
 requires_hermes: ">=0.22.0"
 tags: [pdf, documents, compression, files, privacy, local]
 provides_tools:

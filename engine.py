@@ -19,6 +19,9 @@ Design notes, kept here so the next reader — human or model — knows why:
   reported as failed, never handed over as a success.
 * An existing destination is never overwritten, and the source is hashed before
   and after every run so the "untouched" claim is measured, not assumed.
+* Ladder rungs are built in a private system-temp directory, never beside the
+  source. A read-only source folder therefore still works, and a failed run
+  cannot leave full-size copies next to the user's document.
 
 Pure library on purpose: no Hermes imports, no network, no subprocesses.
 """
@@ -46,6 +49,7 @@ __all__ = [
     "ShrinkResult",
     "DestinationExists",
     "SourceOverwrite",
+    "DestinationNotWritable",
     "human_size",
     "parse_size",
     "inspect_pdf",
@@ -64,6 +68,10 @@ class DestinationExists(ValueError):
 
 class SourceOverwrite(ValueError):
     """The requested output path is the source file itself."""
+
+
+class DestinationNotWritable(OSError):
+    """The output file could not be created in its folder."""
 
 
 _UNIT_FACTORS = {
@@ -969,7 +977,17 @@ def shrink_to_target(
     inspection = inspection or inspect_pdf(source)
     pages = inspection.pages
 
-    workdir = Path(tempfile.mkdtemp(prefix="pdfshrink-", dir=str(source.parent)))
+    # Rungs are full-size PDFs. Build them in a private temp directory, never
+    # in the source folder: that folder may be read-only, and a crash must not
+    # leave hundreds of megabytes beside the user's document. mkdtemp creates
+    # the directory with 0700 permissions.
+    try:
+        workdir = Path(tempfile.mkdtemp(prefix="pdfshrink-"))
+    except OSError as exc:
+        raise OSError(
+            "could not create a temporary working directory in "
+            f"{tempfile.gettempdir()}: {exc}"
+        ) from exc
     attempts: list[Attempt] = []
 
     def run(preset: Preset) -> Attempt:
@@ -1126,13 +1144,33 @@ def shrink_to_target(
             return finish(base)
 
         if destination is None:
+            base_directory = source.parent
+            if not _writable_directory(base_directory):
+                # A read-only source folder must not prevent a shrink: fall
+                # back to the working directory and report the real path.
+                base_directory = Path.cwd()
+            if not _writable_directory(base_directory):
+                raise DestinationNotWritable(
+                    f"neither {source.parent} nor {Path.cwd()} is writable; "
+                    "pass output_path pointing at a writable folder"
+                )
             while True:
-                destination = _default_destination(source)
+                destination = _default_destination(source, base_directory)
                 try:
                     reserved = _reserve_destination(destination)
                     break
                 except FileExistsError:
                     continue
+                except OSError as exc:
+                    if base_directory != Path.cwd() and _writable_directory(
+                        Path.cwd()
+                    ):
+                        base_directory = Path.cwd()
+                        continue
+                    raise DestinationNotWritable(
+                        f"could not create {destination}: {exc}; pass output_path "
+                        "pointing at a writable folder"
+                    ) from exc
         else:
             destination = Path(destination).expanduser().resolve()
             if destination == source:
@@ -1151,12 +1189,23 @@ def shrink_to_target(
                 raise DestinationExists(
                     f"{destination} already exists; PDF Shrink never overwrites a file"
                 )
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise DestinationNotWritable(
+                    f"could not create the folder for {destination}: {exc}; "
+                    "pass output_path pointing at a writable folder"
+                ) from exc
             try:
                 reserved = _reserve_destination(destination)
             except FileExistsError as exc:
                 raise DestinationExists(
                     f"{destination} already exists; PDF Shrink never overwrites a file"
+                ) from exc
+            except OSError as exc:
+                raise DestinationNotWritable(
+                    f"could not create {destination}: {exc}; pass output_path "
+                    "pointing at a writable folder"
                 ) from exc
 
         candidate_hash = sha256_file(chosen.path)
@@ -1228,12 +1277,24 @@ def _should_deliver(fits: bool, chosen_bytes: int, source_bytes: int) -> bool:
     return chosen_bytes * 100 <= source_bytes * 98
 
 
-def _default_destination(source: Path) -> Path:
-    stem = source.with_suffix("")
-    candidate = Path(f"{stem}-compressed.pdf")
+def _writable_directory(path: Path) -> bool:
+    """Best-effort check that a file could be created in ``path``.
+
+    The real create is still done atomically with O_EXCL; this only chooses a
+    sane default folder before the expensive ladder runs.
+    """
+    try:
+        return path.is_dir() and os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
+def _default_destination(source: Path, directory: Path | None = None) -> Path:
+    base = Path(directory) if directory is not None else source.parent
+    candidate = base / f"{source.stem}-compressed.pdf"
     index = 2
     while candidate.exists():
-        candidate = Path(f"{stem}-compressed-{index}.pdf")
+        candidate = base / f"{source.stem}-compressed-{index}.pdf"
         index += 1
     return candidate
 

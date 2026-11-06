@@ -38,8 +38,10 @@ PDF_SHRINK = {
                 "type": "string",
                 "description": (
                     "Where to write the compressed copy. Optional — the default is "
-                    "next to the original, named '<name>-compressed.pdf'. Must not "
-                    "already exist; the tool refuses to overwrite a file."
+                    "next to the original when that folder is writable, otherwise "
+                    "the current working directory; the result reports the real "
+                    "path. Must not already exist; the tool refuses to overwrite a "
+                    "file."
                 ),
             },
             "aggressive": {

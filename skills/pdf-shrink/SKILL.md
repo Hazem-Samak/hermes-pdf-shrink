@@ -56,9 +56,12 @@ meaningfully smaller. Say that, not "it failed".
 ## Things that matter
 
 - **The original is never modified.** The tool writes `<name>-compressed.pdf`
-  beside it, or to `output_path`. Never suggest overwriting the source. If the
+  beside it when that folder is writable, otherwise in the current working
+  directory, or to `output_path`. Never suggest overwriting the source. If the
   output path already exists the call returns `status: "destination_exists"`;
-  choose a different name, do not retry with the same one.
+  choose a different name, do not retry with the same one. If it returns
+  `"destination_not_writable"`, ask the user for a writable `output_path`.
+  Temporary rungs stay in the system temp directory, not beside the PDF.
 - **Quality is chosen by measurement.** The ladder starts at the best setting and
   only gets rougher, rebuilt each time from the pristine original — so the copy
   you get is the mildest setting that fits, not the smallest file possible.
