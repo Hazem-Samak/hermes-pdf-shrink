@@ -5,13 +5,14 @@ PDF_SHRINK = {
     "description": (
         "Shrink a PDF so it fits under a size limit (for example 2 MB), working "
         "entirely on this machine — no upload, no API key. Writes a NEW file and "
-        "never modifies the original. Images are downsampled on a measured "
-        "quality ladder until the file fits; the best quality that still fits "
-        "wins. If the limit cannot be reached without making the document "
-        "unreadable, the tool says so, reports the smallest safe size, and "
-        "saves that copy instead of ruining the document. Returns JSON with the "
-        "output path, before/after sizes, the quality used, and a message ready "
-        "to show the user. When the JSON carries a 'preview_image' path, put that "
+        "never modifies the original; an existing output path is refused rather "
+        "than overwritten. Images are downsampled on a measured quality ladder "
+        "until the file fits; the best quality that still fits wins. If the "
+        "limit cannot be reached without making the document unreadable, the "
+        "tool says so, reports the smallest safe size, and saves the best safe "
+        "copy when it is meaningfully smaller. Returns JSON with the output "
+        "path, before/after sizes, the quality used, and a message ready to "
+        "show the user. When the JSON carries a 'preview_image' path, put that "
         "path in your reply on its own line as MEDIA:<path> so the user sees the "
         "before/after comparison."
     ),
@@ -37,7 +38,8 @@ PDF_SHRINK = {
                 "type": "string",
                 "description": (
                     "Where to write the compressed copy. Optional — the default is "
-                    "next to the original, named '<name>-compressed.pdf'."
+                    "next to the original, named '<name>-compressed.pdf'. Must not "
+                    "already exist; the tool refuses to overwrite a file."
                 ),
             },
             "aggressive": {
@@ -75,7 +77,8 @@ PDF_INSPECT = {
         "Report why a PDF is large and how much it can shrink, without changing "
         "anything. Lists the biggest images, their effective print resolution, "
         "fonts, embedded attachments and duplicates, then gives a verdict "
-        "(images dominate / vector-heavy / already small). Use it before "
+        "(images dominate / images not reclaimable / vector-heavy / already "
+        "small). Use it before "
         "pdf_shrink when the user asks 'why is this file so big?' or 'can this "
         "get to 2 MB?'."
     ),

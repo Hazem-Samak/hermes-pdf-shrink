@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import sys
+import zlib
 from pathlib import Path
 
 import pikepdf
 import pytest
-from PIL import Image
+from PIL import Image, ImageStat
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -63,6 +65,140 @@ def make_pdf(path: Path, pages: int = 3, pixels=(1400, 1900), quality: int = 95,
         )
     pdf.save(str(path))
     return path
+
+
+def _attach_image(pdf, stream, page_size=(200.0, 200.0), draw=None):
+    page = pdf.add_blank_page(page_size=page_size)
+    page.Resources = pikepdf.Dictionary(
+        XObject=pikepdf.Dictionary(Im0=pdf.make_indirect(stream))
+    )
+    page.Contents = pdf.make_stream(
+        draw
+        or f"q {page_size[0]:.2f} 0 0 {page_size[1]:.2f} 0 0 cm /Im0 Do Q".encode()
+    )
+
+
+def _jpeg_stream(pdf, image, quality=92):
+    size = image.size
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=quality)
+    image.close()
+    stream = pikepdf.Stream(pdf, buffer.getvalue())
+    stream.Type = pikepdf.Name.XObject
+    stream.Subtype = pikepdf.Name.Image
+    stream.Width, stream.Height = size
+    stream.ColorSpace = pikepdf.Name.DeviceRGB
+    stream.BitsPerComponent = 8
+    stream.Filter = pikepdf.Name.DCTDecode
+    return stream
+
+
+def make_form_pdf(path: Path) -> Path:
+    """An image drawn only from inside a Form XObject."""
+    pdf = pikepdf.Pdf.new()
+    scan = _jpeg_stream(pdf, noisy_image(1800, 2400))
+    scan = pdf.make_indirect(scan)
+    form = pikepdf.Stream(pdf, b"q 595 0 0 842 0 0 cm /Im0 Do Q")
+    form.Type = pikepdf.Name.XObject
+    form.Subtype = pikepdf.Name.Form
+    form.BBox = [0, 0, 595, 842]
+    form.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=scan))
+    form = pdf.make_indirect(form)
+    page = pdf.add_blank_page(page_size=(595.28, 841.89))
+    page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Fm0=form))
+    page.Contents = pdf.make_stream(b"q 1 0 0 1 0 0 cm /Fm0 Do Q")
+    pdf.save(str(path))
+    pdf.close()
+    return path
+
+
+def make_smask_pdf(path: Path) -> Path:
+    """An RGB image with an 8-bit soft mask of matching dimensions."""
+    pdf = pikepdf.Pdf.new()
+    base = _jpeg_stream(pdf, noisy_image(800, 800))
+    mask = Image.linear_gradient("L").resize((800, 800))
+    soft = pikepdf.Stream(pdf, zlib.compress(mask.tobytes()))
+    soft.Type = pikepdf.Name.XObject
+    soft.Subtype = pikepdf.Name.Image
+    soft.Width = soft.Height = 800
+    soft.ColorSpace = pikepdf.Name.DeviceGray
+    soft.BitsPerComponent = 8
+    soft.Filter = pikepdf.Name.FlateDecode
+    base.SMask = pdf.make_indirect(soft)
+    _attach_image(pdf, base)
+    pdf.save(str(path))
+    pdf.close()
+    return path
+
+
+def make_image_mask_pdf(path: Path) -> Path:
+    """A 1-bit stencil mask with no ColourSpace or BitsPerComponent."""
+    pdf = pikepdf.Pdf.new()
+    bits = (
+        Image.effect_noise((800, 800), 128)
+        .point(lambda value: 255 if value > 128 else 0)
+        .convert("1")
+    )
+    stream = pikepdf.Stream(pdf, zlib.compress(bits.tobytes()))
+    stream.Type = pikepdf.Name.XObject
+    stream.Subtype = pikepdf.Name.Image
+    stream.Width = stream.Height = 800
+    stream.Filter = pikepdf.Name.FlateDecode
+    stream.ImageMask = True
+    _attach_image(pdf, stream, draw=b"q 0 0 1 rg 200 0 0 200 0 0 cm /Im0 Do Q")
+    pdf.save(str(path))
+    pdf.close()
+    return path
+
+
+def make_cmyk_pdf(path: Path) -> Path:
+    pdf = pikepdf.Pdf.new()
+    image = noisy_image(800, 800).convert("CMYK")
+    stream = _jpeg_stream(pdf, image)
+    stream.ColorSpace = pikepdf.Name.DeviceCMYK
+    _attach_image(pdf, stream)
+    pdf.save(str(path))
+    pdf.close()
+    return path
+
+
+def make_decode_pdf(path: Path) -> Path:
+    """A grayscale image whose /Decode array inverts every sample."""
+    pdf = pikepdf.Pdf.new()
+    grain = Image.effect_noise((600, 600), 30)
+    raw = bytes(min(255, 160 + value // 4) for value in grain.tobytes())
+    stream = pikepdf.Stream(pdf, zlib.compress(raw))
+    stream.Type = pikepdf.Name.XObject
+    stream.Subtype = pikepdf.Name.Image
+    stream.Width = stream.Height = 600
+    stream.ColorSpace = pikepdf.Name.DeviceGray
+    stream.BitsPerComponent = 8
+    stream.Filter = pikepdf.Name.FlateDecode
+    stream.Decode = [1, 0]
+    _attach_image(pdf, stream)
+    pdf.save(str(path))
+    pdf.close()
+    return path
+
+
+def image_info(path: Path) -> dict | None:
+    with pikepdf.Pdf.open(path) as pdf:
+        for obj in pdf.objects:
+            if isinstance(obj, pikepdf.Stream) and obj.get("/Subtype") == pikepdf.Name.Image:
+                image = pikepdf.PdfImage(obj).as_pil_image()
+                try:
+                    mean = ImageStat.Stat(image).mean[0]
+                finally:
+                    image.close()
+                return {
+                    "width": int(obj.Width),
+                    "height": int(obj.Height),
+                    "filter": str(obj.get("/Filter")),
+                    "has_smask": "/SMask" in obj,
+                    "has_decode": "/Decode" in obj,
+                    "mean": mean,
+                }
+    return None
 
 
 @pytest.fixture()
@@ -216,6 +352,275 @@ def test_default_destination_never_collides(tmp_path):
     source = make_pdf(tmp_path / "doc.pdf", pages=1)
     (tmp_path / "doc-compressed.pdf").write_bytes(b"placeholder")
     assert engine._default_destination(source).name == "doc-compressed-2.pdf"
+
+
+# --------------------------------------------------------------------------- #
+# Safety regressions
+# --------------------------------------------------------------------------- #
+
+
+def test_existing_destination_is_never_overwritten(tmp_path):
+    source = make_pdf(tmp_path / "src.pdf", pages=1)
+    target = tmp_path / "existing.pdf"
+    target.write_bytes(b"the user's other file")
+
+    with pytest.raises(engine.DestinationExists):
+        engine.shrink_to_target(source, 5_000, destination=target)
+
+    assert target.read_bytes() == b"the user's other file"
+
+
+def test_verification_failure_does_not_deliver(tmp_path, monkeypatch):
+    source = make_pdf(tmp_path / "src.pdf", pages=1)
+    destination = tmp_path / "out.pdf"
+    monkeypatch.setattr(
+        engine,
+        "_verify",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "opens": True,
+            "pages": 1,
+            "pages_equal": False,
+            "blank_pages": 0,
+            "syntax_errors": 0,
+        },
+    )
+
+    result = engine.shrink_to_target(source, 5_000, destination=destination)
+
+    assert result.ok is False
+    assert result.reason == "verification_failed"
+    assert result.output is None
+    assert not destination.exists()
+
+
+def test_a_fitting_copy_is_delivered_even_with_a_tiny_gain():
+    assert engine._should_deliver(True, 999, 1_000)
+    assert not engine._should_deliver(False, 999, 1_000)
+    assert engine._should_deliver(False, 980, 1_000)
+
+
+def test_form_nested_image_is_downsampled(tmp_path):
+    source = make_form_pdf(tmp_path / "form.pdf")
+    report = engine.inspect_pdf(source)
+    assert len(report.images) == 1
+    assert report.reclaimable_bytes > 0
+
+    result = engine.shrink_to_target(
+        source, source.stat().st_size // 3, destination=tmp_path / "form-out.pdf"
+    )
+
+    assert result.ok, result.reason
+    assert result.chosen.images_downsampled == 1
+    info = image_info(result.output)
+    assert info["width"] < 1800
+    assert info["filter"] == "/DCTDecode"
+
+
+def test_soft_masked_image_is_left_alone(tmp_path):
+    source = make_smask_pdf(tmp_path / "alpha.pdf")
+    assert engine.inspect_pdf(source).reclaimable_bytes == 0
+
+    result = engine.shrink_to_target(
+        source, source.stat().st_size // 2, destination=tmp_path / "alpha-out.pdf"
+    )
+
+    assert result.chosen.images_downsampled == 0
+    assert result.chosen.images_skipped == 1
+    assert result.chosen.preset.lossless
+
+
+def test_stencil_mask_is_left_alone(tmp_path):
+    source = make_image_mask_pdf(tmp_path / "mask.pdf")
+    assert engine.inspect_pdf(source).reclaimable_bytes == 0
+
+    result = engine.shrink_to_target(
+        source, 1_000, destination=tmp_path / "mask-out.pdf"
+    )
+
+    assert result.chosen.images_downsampled == 0
+    assert result.chosen.images_skipped == 1
+
+
+def test_cmyk_image_is_left_alone(tmp_path):
+    source = make_cmyk_pdf(tmp_path / "cmyk.pdf")
+    assert engine.inspect_pdf(source).reclaimable_bytes == 0
+
+    result = engine.shrink_to_target(
+        source, source.stat().st_size // 2, destination=tmp_path / "cmyk-out.pdf"
+    )
+
+    assert result.chosen.images_downsampled == 0
+    assert result.chosen.images_skipped == 1
+
+
+def test_decode_array_image_is_left_alone(tmp_path):
+    source = make_decode_pdf(tmp_path / "decode.pdf")
+    assert engine.inspect_pdf(source).reclaimable_bytes == 0
+
+    result = engine.shrink_to_target(
+        source,
+        int(source.stat().st_size * 0.3),
+        destination=tmp_path / "decode-out.pdf",
+    )
+
+    assert result.chosen.images_downsampled == 0
+    assert result.chosen.images_skipped == 1
+    if result.output is not None:
+        assert image_info(result.output)["has_decode"] is True
+
+
+def test_suggested_target_is_reachable(plugin):
+    tools = plugin.tools
+    assert tools._suggest_target(1_132_128, 1_133_080) is None
+
+    text = tools._suggest_target(1_693_542, 29_131_000)
+    assert text is not None
+    assert 1_693_542 <= engine.parse_size(text) < 29_131_000
+
+
+def make_vector_pdf(path: Path, pages: int = 2, lines: int = 2500) -> Path:
+    import random
+
+    pdf = pikepdf.Pdf.new()
+    rng = random.Random(11)
+    for _ in range(pages):
+        ops = ["0.5 w"]
+        for _ in range(lines):
+            x1, y1 = rng.uniform(0, 595), rng.uniform(0, 842)
+            x2, y2 = x1 + rng.uniform(-70, 70), y1 + rng.uniform(-70, 70)
+            ops.append(f"{x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S")
+        page = pdf.add_blank_page(page_size=(595.28, 841.89))
+        page.Contents = pdf.make_stream("\n".join(ops).encode())
+    pdf.save(str(path), compress_streams=False)
+    pdf.close()
+    return path
+
+
+def test_lossless_floor_does_not_suggest_aggressive(tmp_path, plugin):
+    source = make_vector_pdf(tmp_path / "vector.pdf")
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "1 KB",
+                "output_path": str(tmp_path / "vector-out.pdf"),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "target_unreachable"
+    assert payload["smallest_safe"]["quality"] == "lossless cleanup only"
+    assert not any("aggressive" in text for text in payload["suggestions"])
+    assert "without changing the document" in payload["message"]
+
+
+def test_handler_refuses_an_existing_output(tmp_path, plugin):
+    source = make_pdf(tmp_path / "src.pdf", pages=1)
+    target = tmp_path / "existing.pdf"
+    target.write_bytes(b"keep me")
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "500 KB",
+                "output_path": str(target),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "destination_exists"
+    assert "never overwrites" in payload["message"]
+    assert target.read_bytes() == b"keep me"
+
+
+def test_handler_reports_verification_failure(tmp_path, monkeypatch, plugin):
+    source = make_pdf(tmp_path / "src.pdf", pages=1)
+    engine_module = plugin.tools._engine()
+    monkeypatch.setattr(
+        engine_module,
+        "_verify",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "opens": True,
+            "pages": 1,
+            "pages_equal": False,
+            "blank_pages": 0,
+            "syntax_errors": 0,
+        },
+    )
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "5 KB",
+                "output_path": str(tmp_path / "out.pdf"),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "verification_failed"
+    assert payload["output"] is None
+    assert "failed the re-open check" in payload["message"]
+
+
+def test_handler_never_claims_the_source_was_untouched(tmp_path, monkeypatch, plugin):
+    source = make_pdf(tmp_path / "src.pdf", pages=1)
+    engine_module = plugin.tools._engine()
+    original = engine_module._apply_preset
+
+    def tamper(pdf, plan, preset):
+        result = original(pdf, plan, preset)
+        source.write_bytes(source.read_bytes() + b"\n% changed while working")
+        return result
+
+    monkeypatch.setattr(engine_module, "_apply_preset", tamper)
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "5 KB",
+                "output_path": str(tmp_path / "out.pdf"),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "source_changed"
+    assert payload["original"]["untouched"] is False
+    assert "Original untouched" not in payload["message"]
+    assert "cannot claim" in payload["message"]
+
+
+def test_dropped_attachments_are_reported(tmp_path, plugin):
+    base = make_pdf(tmp_path / "attached-base.pdf", pages=1)
+    source = tmp_path / "attached.pdf"
+    with pikepdf.Pdf.open(base) as pdf:
+        pdf.attachments["notes.bin"] = b"x" * 300_000
+        pdf.save(str(source))
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "500 KB",
+                "output_path": str(tmp_path / "attached-out.pdf"),
+                "drop_attachments": True,
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "fits"
+    assert payload["dropped_attachments"]["count"] == 1
+    assert payload["verified"]["attachments"] == 0
+    assert "Dropped 1 embedded attachment" in payload["message"]
 
 
 # --------------------------------------------------------------------------- #

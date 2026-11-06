@@ -184,6 +184,7 @@ def build_vector_heavy(path: Path, pages: int = 8) -> None:
 def main(argv: list[str]) -> int:
     outdir = Path(argv[1]) if len(argv) > 1 else Path("demo")
     outdir.mkdir(parents=True, exist_ok=True)
+    random.seed(2026)  # the committed assets quote exact sizes
     build_scanned_report(outdir / "scanned-report.pdf")
     build_vector_heavy(outdir / "vector-heavy.pdf")
     return 0

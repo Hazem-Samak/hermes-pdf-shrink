@@ -13,6 +13,12 @@ Design notes, kept here so the next reader — human or model — knows why:
   page resolution.
 * When the target is out of reach the engine returns the smallest safe copy
   plus the numbers that prove it, rather than quietly destroying the document.
+* Images whose masks or colour model cannot be carried through a re-encode
+  (soft/stencil masks, CMYK, non-8-bit samples) are left byte-for-byte alone.
+  A copy is verified before it is delivered; a file that fails verification is
+  reported as failed, never handed over as a success.
+* An existing destination is never overwritten, and the source is hashed before
+  and after every run so the "untouched" claim is measured, not assumed.
 
 Pure library on purpose: no Hermes imports, no network, no subprocesses.
 """
@@ -38,6 +44,8 @@ __all__ = [
     "ImageRecord",
     "Inspection",
     "ShrinkResult",
+    "DestinationExists",
+    "SourceOverwrite",
     "human_size",
     "parse_size",
     "inspect_pdf",
@@ -49,6 +57,14 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # Sizes
 # --------------------------------------------------------------------------- #
+
+class DestinationExists(ValueError):
+    """The requested output path already exists; this tool never overwrites it."""
+
+
+class SourceOverwrite(ValueError):
+    """The requested output path is the source file itself."""
+
 
 _UNIT_FACTORS = {
     "b": 1,
@@ -113,7 +129,8 @@ def human_size(num_bytes: int) -> str:
             value = num_bytes / factor
             if value >= 100:
                 return f"{value:.0f} {unit}"
-            return f"{value:.2f} {unit}".replace(".00", "")
+            text = f"{value:.2f}".rstrip("0").rstrip(".")
+            return f"{text} {unit}"
     return f"{num_bytes} B"
 
 
@@ -319,6 +336,10 @@ class ImageRecord:
     colorspace: str
     display_pt: tuple | None = None
     pages: list = field(default_factory=list)
+    mode: str = ""
+    masked: bool = False
+    is_mask: bool = False
+    has_decode: bool = False
 
     @property
     def megapixels(self) -> float:
@@ -338,6 +359,38 @@ class ImageRecord:
             return False
         return self.bits >= 8
 
+    @property
+    def reencode_blocker(self) -> str | None:
+        """Why this image must be left alone, or None when it is safe to touch.
+
+        Masks are never resampled independently: a soft mask must keep the same
+        pixel dimensions as the image it masks, a stencil mask paints in the
+        current fill colour, and a colour-key mask is defined in the image's own
+        colour space. Re-encoding any of them without carrying the mask through
+        the same transform is how images come back transparent, black or
+        inverted. CMYK is also left alone: a naive CMYK→RGB conversion shifts
+        print colours, and the plugin has no ICC pipeline. A /Decode array is a
+        second colour transform pikepdf versions disagree on applying, so those
+        images are left alone rather than risk delivering inverted pixels.
+        """
+        if self.masked:
+            return "has a mask or is an image mask"
+        if self.is_mask:
+            return "is used as a mask"
+        if self.bits != 8:
+            return f"{self.bits}-bit samples"
+        if self.mode not in ("L", "RGB", "P"):
+            return f"{self.mode or 'unknown'} colour"
+        if self.has_decode:
+            return "has a /Decode array"
+        if not self.decodable:
+            return "encoding is already efficient"
+        return None
+
+    @property
+    def reencodable(self) -> bool:
+        return self.reencode_blocker is None and self.raw_bytes >= 16_000
+
 
 def _filter_names(obj) -> tuple:
     try:
@@ -353,7 +406,7 @@ def _filter_names(obj) -> tuple:
 
 def _collect_images(pdf) -> dict:
     """Every distinct image XObject reachable from page resources."""
-    found: dict = {}
+    entries: dict = {}
 
     def visit(resources, depth, seen_forms):
         for _name, entry in _xobjects(resources).items():
@@ -363,34 +416,7 @@ def _collect_images(pdf) -> dict:
                 continue
             key = _obj_key(entry)
             if subtype == Name.Image:
-                if key in found:
-                    continue
-                try:
-                    width = int(entry.get("/Width") or 0)
-                    height = int(entry.get("/Height") or 0)
-                except Exception:  # noqa: BLE001
-                    continue
-                try:
-                    raw_bytes = len(entry.read_raw_bytes())
-                except Exception:  # noqa: BLE001
-                    raw_bytes = 0
-                try:
-                    bits = int(entry.get("/BitsPerComponent") or 8)
-                except Exception:  # noqa: BLE001
-                    bits = 8
-                try:
-                    colorspace = str(entry.get("/ColorSpace") or "unknown")
-                except Exception:  # noqa: BLE001
-                    colorspace = "unknown"
-                found[key] = ImageRecord(
-                    key=key,
-                    raw_bytes=raw_bytes,
-                    width=width,
-                    height=height,
-                    filter_names=_filter_names(entry),
-                    bits=bits,
-                    colorspace=colorspace,
-                )
+                entries.setdefault(key, entry)
             elif subtype == Name.Form and depth < 6 and key not in seen_forms:
                 visit(
                     entry.get("/Resources") or resources,
@@ -398,9 +424,66 @@ def _collect_images(pdf) -> dict:
                     seen_forms | {key},
                 )
 
+    for page in pdf.pages:
+        visit(_resources_of(page), 0, frozenset())
+
+    # An image that another image uses as a mask is not a picture in its own
+    # right; touching it would damage the picture it masks.
+    mask_keys = set()
+    for entry in entries.values():
+        for name in ("/SMask", "/Mask"):
+            try:
+                candidate = entry.get(name)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(candidate, pikepdf.Stream):
+                mask_keys.add(_obj_key(candidate))
+
+    found: dict = {}
+    for key, entry in entries.items():
+        try:
+            width = int(entry.get("/Width") or 0)
+            height = int(entry.get("/Height") or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            raw_bytes = len(entry.read_raw_bytes())
+        except Exception:  # noqa: BLE001
+            raw_bytes = 0
+        try:
+            bits = int(entry.get("/BitsPerComponent") or 8)
+        except Exception:  # noqa: BLE001
+            bits = 8
+        try:
+            colorspace = str(entry.get("/ColorSpace") or "unknown")
+        except Exception:  # noqa: BLE001
+            colorspace = "unknown"
+        try:
+            mode = str(pikepdf.PdfImage(entry).mode)
+        except Exception:  # noqa: BLE001
+            mode = ""
+        try:
+            masked = bool(entry.get("/ImageMask")) or any(
+                name in entry for name in ("/SMask", "/Mask", "/Matte")
+            )
+        except Exception:  # noqa: BLE001
+            masked = False
+        found[key] = ImageRecord(
+            key=key,
+            raw_bytes=raw_bytes,
+            width=width,
+            height=height,
+            filter_names=_filter_names(entry),
+            bits=bits,
+            colorspace=colorspace,
+            mode=mode,
+            masked=masked,
+            is_mask=key in mask_keys,
+            has_decode="/Decode" in entry,
+        )
+
     for page_index, page in enumerate(pdf.pages):
         resources = _resources_of(page)
-        visit(resources, 0, frozenset())
         for key, record in found.items():
             if page_index not in record.pages and _page_has_key(resources, key):
                 record.pages.append(page_index)
@@ -462,6 +545,14 @@ class Inspection:
     @property
     def duplicates(self) -> int:
         return sum(1 for r in self.images.values() if len(r.pages) > 1)
+
+    @property
+    def reclaimable(self) -> list:
+        return [r for r in self.images.values() if r.reencodable]
+
+    @property
+    def reclaimable_bytes(self) -> int:
+        return sum(r.raw_bytes for r in self.reclaimable)
 
     def biggest(self, count: int = 3) -> list:
         ordered = sorted(self.images.values(), key=lambda r: r.raw_bytes, reverse=True)
@@ -552,7 +643,7 @@ def inspect_pdf(path: Path) -> Inspection:
 
 def _target_dimensions(record: ImageRecord, preset: Preset, page_box) -> tuple | None:
     """Pixel size for this image at the preset's DPI, or None to leave it alone."""
-    if preset.dpi is None or not record.decodable or record.raw_bytes < 16_000:
+    if preset.dpi is None or not record.reencodable:
         return None
     display = record.display_pt or page_box
     if not display or display[0] <= 0 or display[1] <= 0:
@@ -571,40 +662,80 @@ def _target_dimensions(record: ImageRecord, preset: Preset, page_box) -> tuple |
     return new_w, new_h
 
 
-def _replace_with_jpeg(stream, pil_image, quality: int) -> int:
-    """Write a JPEG body into ``stream`` and fix its dictionary. Returns new bytes."""
-    if pil_image.mode in ("1", "L", "LA"):
-        pil_image = pil_image.convert("L")
-        colorspace = Name.DeviceGray
-    elif pil_image.mode in ("RGB", "RGBA", "P", "CMYK", "YCbCr"):
-        pil_image = pil_image.convert("RGB")
-        colorspace = Name.DeviceRGB
-    else:
-        pil_image = pil_image.convert("RGB")
-        colorspace = Name.DeviceRGB
+def _walk_images(resources, depth: int = 0, seen_forms=frozenset()):
+    """Yield every image XObject reachable from a resource tree.
 
-    buffer = io.BytesIO()
-    pil_image.save(
-        buffer,
-        format="JPEG",
-        quality=quality,
-        optimize=True,
-        progressive=False,
-        subsampling=2,
-    )
-    payload = buffer.getvalue()
-
-    stream.write(payload, filter=Name.DCTDecode)
-    for key in ("/SMask", "/Mask", "/Decode", "/DecodeParms", "/Alternates", "/Matte"):
+    Form XObjects are opaque containers as far as the page content stream is
+    concerned, so an image drawn only inside a form is invisible to a walk over
+    page resources. Inspection already descends into forms; this keeps the
+    rewrite in step with it.
+    """
+    for _name, entry in _xobjects(resources).items():
         try:
-            stream.pop(key, None)
+            subtype = entry.get("/Subtype")
         except Exception:  # noqa: BLE001
-            pass
-    stream.Width = pil_image.width
-    stream.Height = pil_image.height
+            continue
+        if subtype == Name.Image:
+            yield entry
+        elif subtype == Name.Form and depth < 6:
+            key = _obj_key(entry)
+            if key in seen_forms:
+                continue
+            yield from _walk_images(
+                entry.get("/Resources") or resources,
+                depth + 1,
+                seen_forms | {key},
+            )
+
+
+def _encode_jpeg(pil_image, quality: int):
+    """Encode to JPEG and prove the payload decodes at the expected size."""
+    from PIL import Image  # local import keeps plugin load cheap
+
+    if pil_image.mode in ("1", "L", "LA"):
+        work = pil_image.convert("L")
+        colorspace = Name.DeviceGray
+    elif pil_image.mode in ("RGB", "RGBA", "P"):
+        work = pil_image.convert("RGB")
+        colorspace = Name.DeviceRGB
+    else:  # CMYK and anything exotic is filtered out before we get here
+        raise ValueError(f"unsupported image mode {pil_image.mode}")
+
+    try:
+        buffer = io.BytesIO()
+        work.save(
+            buffer,
+            format="JPEG",
+            quality=quality,
+            optimize=True,
+            progressive=False,
+            subsampling=2,
+        )
+        payload = buffer.getvalue()
+        probe = Image.open(io.BytesIO(payload))
+        try:
+            probe.load()
+            size = probe.size
+        finally:
+            probe.close()
+        if size != work.size:
+            raise ValueError("JPEG round-trip changed the image dimensions")
+        return payload, colorspace, size
+    finally:
+        if work is not pil_image:
+            work.close()
+
+
+def _write_jpeg(stream, payload: bytes, colorspace, size: tuple) -> None:
+    """Replace a stream body and remove keys that no longer describe it."""
+    stream.write(payload, filter=Name.DCTDecode)
+    for key in ("/Decode", "/DecodeParms", "/Alternates"):
+        if key in stream:
+            del stream[key]
+    stream.Width = size[0]
+    stream.Height = size[1]
     stream.ColorSpace = colorspace
     stream.BitsPerComponent = 8
-    return len(payload)
 
 
 def _apply_preset(pdf, plan: dict, preset: Preset) -> tuple:
@@ -617,47 +748,56 @@ def _apply_preset(pdf, plan: dict, preset: Preset) -> tuple:
     processed: set = set()
 
     for _page_index, page in enumerate(pdf.pages):
-        page_box = None
         try:
             box = page.MediaBox
             page_box = (float(box[2]) - float(box[0]), float(box[3]) - float(box[1]))
         except Exception:  # noqa: BLE001
             page_box = (612.0, 792.0)
 
-        for _name, entry in _xobjects(_resources_of(page)).items():
-            try:
-                if entry.get("/Subtype") != Name.Image:
-                    continue
-            except Exception:  # noqa: BLE001
-                continue
+        for entry in _walk_images(_resources_of(page)):
             key = _obj_key(entry)
             if key not in plan or key in processed:
                 continue
             processed.add(key)
             record = plan[key]
+            if record.reencode_blocker is not None:
+                skipped += 1
+                continue
             dims = _target_dimensions(record, preset, page_box)
             if dims is None:
                 continue
 
             before = record.raw_bytes
+            pil = None
+            resized = None
             try:
                 pil = pikepdf.PdfImage(entry).as_pil_image()
+                resized = pil.resize(dims, Image.LANCZOS)
+                payload, colorspace, size = _encode_jpeg(
+                    resized, preset.quality or 75
+                )
             except Exception:  # noqa: BLE001 - undecodable image: leave it be
                 skipped += 1
                 continue
+            finally:
+                for image in (resized, pil):
+                    try:
+                        if image is not None:
+                            image.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            if len(payload) >= before:
+                # A re-encode that does not save bytes is all cost and no gain.
+                skipped += 1
+                continue
             try:
-                pil = pil.resize(dims, Image.LANCZOS)
-                after = _replace_with_jpeg(entry, pil, preset.quality or 75)
+                _write_jpeg(entry, payload, colorspace, size)
             except Exception:  # noqa: BLE001
                 skipped += 1
                 continue
-            finally:
-                try:
-                    pil.close()
-                except Exception:  # noqa: BLE001
-                    pass
             downsampled += 1
-            saved += max(0, before - after)
+            saved += before - len(payload)
 
     return downsampled, skipped, saved
 
@@ -705,6 +845,11 @@ class Attempt:
         if self.preset.lossless:
             return "lossless cleanup only"
         if self.images_downsampled == 0:
+            if self.images_skipped:
+                return (
+                    "structure cleanup only "
+                    f"({self.images_skipped} image(s) left alone)"
+                )
             return "structure cleanup only (no image needed re-encoding)"
         return self.preset.describe()
 
@@ -748,7 +893,13 @@ class ShrinkResult:
 
 def _verify(output: Path, expected_pages: int) -> dict:
     """Reopen the result and prove it is a whole, readable document."""
-    report = {"pages_equal": False, "opens": False, "pages": 0, "blank_pages": 0}
+    report = {
+        "pages_equal": False,
+        "opens": False,
+        "pages": 0,
+        "blank_pages": 0,
+        "syntax_errors": 0,
+    }
     try:
         with Pdf.open(output) as check:
             report["opens"] = True
@@ -765,10 +916,32 @@ def _verify(output: Path, expected_pages: int) -> dict:
                 except Exception:  # noqa: BLE001
                     pass
             report["blank_pages"] = blank
+            try:
+                report["attachments"] = _attachments(check)[0]
+            except Exception:  # noqa: BLE001
+                report["attachments"] = None
+            checker = getattr(check, "check_pdf_syntax", None)
+            if checker is None:
+                report["syntax_checked"] = False
+            else:
+                try:
+                    problems = list(checker())
+                except Exception as exc:  # noqa: BLE001
+                    report["syntax_checked"] = False
+                    report["syntax_error"] = f"{type(exc).__name__}: {exc}"
+                    problems = []
+                else:
+                    report["syntax_checked"] = True
+                    report["syntax_errors"] = len(problems)
+                    if problems:
+                        report["syntax_problems"] = problems[:5]
     except Exception as exc:  # noqa: BLE001
         report["error"] = f"{type(exc).__name__}: {exc}"
     report["ok"] = bool(
-        report["opens"] and report["pages_equal"] and report["blank_pages"] == 0
+        report["opens"]
+        and report["pages_equal"]
+        and report["blank_pages"] == 0
+        and report["syntax_errors"] == 0
     )
     return report
 
@@ -821,6 +994,15 @@ def shrink_to_target(
         return attempt
 
     def finish(result: ShrinkResult) -> ShrinkResult:
+        # The "original untouched" claim is a measurement, not a comment: take
+        # it on every exit path, including the early ones.
+        try:
+            result.source_untouched = sha256_file(source) == source_hash
+        except OSError:
+            result.source_untouched = False
+        if not result.source_untouched:
+            result.ok = False
+            result.reason = "source_changed"
         shutil.rmtree(workdir, ignore_errors=True)
         return result
 
@@ -852,8 +1034,15 @@ def shrink_to_target(
             base.output = source
             base.output_bytes = source_bytes
             base.verified = True
-            base.verification = {"ok": True, "opens": True, "pages": pages,
-                                 "pages_equal": True, "blank_pages": 0}
+            base.verification = {
+                "ok": True,
+                "opens": True,
+                "pages": pages,
+                "pages_equal": True,
+                "blank_pages": 0,
+                "syntax_errors": 0,
+                "attachments": inspection.attachments,
+            }
             base.seconds = round(time.monotonic() - started, 2)
             return finish(base)
 
@@ -861,15 +1050,13 @@ def shrink_to_target(
         # nothing in quality and sometimes lands inside the target on its own.
         lossless = run(PRESETS[0])
         shrinkable = sum(
-            1
-            for record in inspection.images.values()
-            if record.decodable and record.raw_bytes >= 16_000
+            1 for record in inspection.images.values() if record.reencodable
         )
         if lossless.bytes <= target_bytes:
             chosen = lossless
         elif shrinkable == 0:
-            # Nothing in here is an image we could re-encode: walking the ladder
-            # would rebuild the same file six times and prove nothing.
+            # Nothing in here is an image we could safely re-encode: walking the
+            # ladder would rebuild the same file six times and prove nothing.
             chosen = lossless
         else:
             ladder = list(AGGRESSIVE_LADDER if aggressive else SAFE_LADDER)
@@ -895,7 +1082,8 @@ def shrink_to_target(
                     if time.monotonic() - started > max_seconds:
                         break
                     stronger = run(ladder[index])
-                    best = stronger
+                    if stronger.bytes < best.bytes:
+                        best = stronger
                     if stronger.bytes <= target_bytes:
                         chosen = stronger
                         break
@@ -906,49 +1094,138 @@ def shrink_to_target(
         base.attempts = attempts
         fits = chosen is not None and chosen.bytes <= target_bytes
 
-        # Deliver the best copy either way: on a miss it is the smallest *safe*
-        # version, and the report says so. We skip delivering only when the best
-        # copy is not meaningfully smaller than the original.
-        deliver = chosen is not None and chosen.bytes <= source_bytes * 0.98
+        # Verify the candidate before it is allowed near the user's directory.
+        verification = _verify(chosen.path, pages) if chosen is not None else {}
+        if chosen is None or not verification.get("ok"):
+            base.ok = False
+            base.reason = "verification_failed"
+            base.floor = chosen
+            base.output = None
+            base.output_bytes = source_bytes
+            base.verified = False
+            base.verification = verification
+            base.seconds = round(time.monotonic() - started, 2)
+            return finish(base)
+
+        # A copy that fits the limit is always delivered, even when the saving
+        # is small: refusing it because it is "only" 1% smaller would throw away
+        # a file the user asked for. On a miss, deliver the smallest attempt
+        # only when it saves at least 2%; a rounding-error copy is not worth a
+        # new file, and the report names the best attempt either way.
+        deliver = _should_deliver(fits, chosen.bytes, source_bytes)
         if not deliver:
             base.ok = False
-            base.reason = "target_unreachable" if not fits else "no_gain"
+            base.reason = "target_unreachable"
             base.floor = chosen
             base.output = None
             # Nothing smaller exists, so the honest number is the original size.
             base.output_bytes = source_bytes
             base.verified = False
-            base.verification = _verify(chosen.path, pages) if chosen else {}
+            base.verification = verification
             base.seconds = round(time.monotonic() - started, 2)
             return finish(base)
 
         if destination is None:
-            destination = _default_destination(source)
-        destination = Path(destination).expanduser().resolve()
-        if destination == source:
-            raise ValueError("refusing to overwrite the source file")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(chosen.path), str(destination))
+            while True:
+                destination = _default_destination(source)
+                try:
+                    reserved = _reserve_destination(destination)
+                    break
+                except FileExistsError:
+                    continue
+        else:
+            destination = Path(destination).expanduser().resolve()
+            if destination == source:
+                raise SourceOverwrite(
+                    "refusing to overwrite the source file; pick another name"
+                )
+            if destination.exists():
+                try:
+                    same = os.path.samefile(destination, source)
+                except OSError:
+                    same = False
+                if same:
+                    raise SourceOverwrite(
+                        "refusing to overwrite the source file; pick another name"
+                    )
+                raise DestinationExists(
+                    f"{destination} already exists; PDF Shrink never overwrites a file"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                reserved = _reserve_destination(destination)
+            except FileExistsError as exc:
+                raise DestinationExists(
+                    f"{destination} already exists; PDF Shrink never overwrites a file"
+                ) from exc
+
+        candidate_hash = sha256_file(chosen.path)
+        _copy_to_destination(chosen.path, destination, reserved)
         chosen.path = destination
 
-        verification = _verify(destination, pages)
-        untouched = sha256_file(source) == source_hash
-        base.ok = bool(fits)
-        base.reason = "fits" if fits else "target_unreachable"
-        base.floor = None if fits else chosen
+        # The copied bytes are the bytes that already passed verification. Hash
+        # them instead of parsing the whole document a second time; if the hash
+        # differs, fall back to a full re-open.
+        if sha256_file(destination) == candidate_hash:
+            verification["copy_hash_match"] = True
+        else:
+            verification = _verify(destination, pages)
+            verification["copy_hash_match"] = False
+            verification["ok"] = False
+            verification["error"] = (
+                "the copied bytes differ from the verified candidate"
+            )
         base.output = destination
         base.output_bytes = destination.stat().st_size
         base.verified = bool(verification.get("ok"))
         base.verification = verification
-        base.source_untouched = untouched
+        base.floor = None if fits else chosen
+        base.ok = bool(fits and base.verified)
+        if not verification.get("ok"):
+            base.reason = "verification_failed"
+        elif fits:
+            base.reason = "fits"
+        else:
+            base.reason = "target_unreachable"
         base.seconds = round(time.monotonic() - started, 2)
-        if not untouched:  # pragma: no cover - would be a serious bug
-            base.ok = False
-            base.reason = "source_changed"
         return finish(base)
     except Exception:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
+
+
+def _reserve_destination(destination: Path) -> int:
+    """Create the destination atomically, failing if anything already exists."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    return os.open(str(destination), flags, 0o666)
+
+
+def _copy_to_destination(candidate: Path, destination: Path, fd: int) -> None:
+    try:
+        with os.fdopen(fd, "wb") as out, open(candidate, "rb") as source_file:
+            shutil.copyfileobj(source_file, out, 1 << 20)
+            out.flush()
+            try:
+                os.fsync(out.fileno())
+            except OSError:  # not every filesystem supports it
+                pass
+    except BaseException:
+        try:
+            os.unlink(destination)
+        except OSError:
+            pass
+        raise
+
+
+def _should_deliver(fits: bool, chosen_bytes: int, source_bytes: int) -> bool:
+    """A fitting copy is always worth delivering, however small the saving.
+
+    On a miss, a sub-2% saving is not worth writing another file; the report
+    says what the best attempt was instead.
+    """
+    if fits:
+        return True
+    return chosen_bytes * 100 <= source_bytes * 98
 
 
 def _default_destination(source: Path) -> Path:

@@ -1,6 +1,6 @@
 name: pdf-shrink
 label: PDF Shrink
-version: 1.0.0
+version: 1.0.1
 manifest_version: 2
 author: Hazem Samak
 license: MIT
@@ -8,12 +8,14 @@ homepage: https://github.com/Hazem-Samak/hermes-pdf-shrink
 description: >-
   Shrink a PDF to a size limit (2 MB, 500 KB, whatever the upload form says)
   entirely on your own machine — no upload, no API key, no third-party service.
-  Writes a new file, never the original, downsampling each image to the
-  resolution it is actually displayed at and walking a measured quality ladder
-  until the file fits. When the limit cannot be reached without making the
-  document unreadable it says so, reports the smallest safe size, and saves that
-  copy instead of degrading the document. Includes a before/after preview image
-  and a size breakdown of what makes a PDF heavy.
+  Writes a new file, never the original, and refuses to overwrite an existing
+  one. Images it can re-encode safely are downsampled to the resolution they are
+  actually displayed at, then a measured quality ladder runs until the file
+  fits. When the limit cannot be reached without making the document unreadable
+  it says so, reports the smallest safe size, and saves the best safe copy when
+  it is meaningfully smaller instead of degrading the document. Includes a
+  before/after preview image when PDFium is available, and a size breakdown of
+  what makes a PDF heavy.
 requires_hermes: ">=0.22.0"
 tags: [pdf, documents, compression, files, privacy, local]
 provides_tools:

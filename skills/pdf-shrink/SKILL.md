@@ -40,24 +40,32 @@ the fastest way for the user to judge whether the quality is acceptable.
 This is not a failure to hide — it is the point of the tool. Say plainly:
 
 1. The target was not reachable **without making it unreadable**.
-2. What the smallest safe size is, and where that copy was saved.
-3. The two levers: raise the target to the `suggestions` value, or re-run with
-   `aggressive=true` (72 DPI — noticeably rough on scanned text).
+2. What the smallest safe size is, and where that copy was saved (if `output` is
+   present).
+3. The levers that are actually in `suggestions` — normally a higher target;
+   `aggressive=true` is listed only when it can help. Do not invent a lever that
+   is not there.
 
 Do not claim success, and do not hand over a file that only "fits" if the tool
 says it fits. `ok: false` means the copy that exists is the honest floor, not the
 goal.
 
+If `status` is `"no_gain"`, no copy was written: the best safe attempt was not
+meaningfully smaller. Say that, not "it failed".
+
 ## Things that matter
 
 - **The original is never modified.** The tool writes `<name>-compressed.pdf`
-  beside it, or to `output_path`. Never suggest overwriting the source.
+  beside it, or to `output_path`. Never suggest overwriting the source. If the
+  output path already exists the call returns `status: "destination_exists"`;
+  choose a different name, do not retry with the same one.
 - **Quality is chosen by measurement.** The ladder starts at the best setting and
   only gets rougher, rebuilt each time from the pristine original — so the copy
   you get is the mildest setting that fits, not the smallest file possible.
 - **Scanned PDFs shrink most** (images are 90%+ of the file). Text-and-vector
-  PDFs barely move; if `pdf_inspect` says `vector_or_text`, tell the user that up
-  front instead of burning a minute on a shrink that cannot work.
+  PDFs barely move; if `pdf_inspect` says `vector_or_text` or
+  `images_not_reclaimable`, tell the user that up front instead of burning a
+  minute on a shrink that cannot work.
 - **Password-protected PDFs are refused.** Say so and suggest removing the
   password (Preview → Export as PDF, or `qpdf --decrypt in.pdf out.pdf`).
 - **Attachments.** If `pdf_inspect` shows big embedded attachments, ask before
@@ -67,6 +75,11 @@ goal.
 
 ## Verify before you brag
 
-The JSON carries `verified.reopens` and `verified.page_count_matches`. Only say
-"checked" when those are true. If `verified.blank_pages` is above zero, tell the
-user the copy needs a look and point at `preview_image`.
+The JSON carries `verified.reopens`, `verified.page_count_matches` and
+`verified.syntax_errors`. Only say "checked" when `reopens` and
+`page_count_matches` are true and `syntax_errors` is zero. If `blank_pages` is
+above zero, tell the user the copy needs a look and point at `preview_image`.
+
+If `status` is `"verification_failed"`, the copy did not pass those checks: say
+not to rely on it. If it is `"source_changed"`, the original changed while the
+tool worked; say that plainly and do not claim it was untouched.

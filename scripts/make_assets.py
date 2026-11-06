@@ -47,7 +47,7 @@ def font(size: int, bold: bool = False):
     return ImageFont.load_default(size=size)
 
 
-def banner(page_image: Image.Image, out_path: Path) -> Path:
+def banner(page_image: Image.Image, out_path: Path, size_in: str, size_out: str) -> Path:
     width, height = 1200, 600
     canvas = Image.new("RGB", (width, height), INK)
     draw = ImageDraw.Draw(canvas)
@@ -61,8 +61,8 @@ def banner(page_image: Image.Image, out_path: Path) -> Path:
     )
 
     lines = [
-        ("29.13 MB", "in", MUTED),
-        ("1.69 MB", "out", (140, 210, 160)),
+        (size_in, "in", MUTED),
+        (size_out, "out", (140, 210, 160)),
     ]
     x = 66
     for value, label, colour in lines:
@@ -102,18 +102,50 @@ def banner(page_image: Image.Image, out_path: Path) -> Path:
 
 
 def main(argv: list[str]) -> int:
+    import json
+
     demo = Path(argv[1]) if len(argv) > 1 else ROOT / "demo"
     assets = Path(argv[2]) if len(argv) > 2 else ROOT / "assets"
     original = demo / "scanned-report.pdf"
     compressed = demo / "scanned-report-compressed.pdf"
-    if not original.exists() or not compressed.exists():
-        raise SystemExit("run scripts/make_demo_pdf.py and a shrink first")
+    metadata_path = compressed.with_suffix(".json")
+    if not original.exists() or not compressed.exists() or not metadata_path.exists():
+        raise SystemExit(
+            "run scripts/build_demo.sh (or tests/render_preview.py '2 MB' first)"
+        )
 
-    page = preview.render_page(original, 0, dpi=110)
-    print(banner(page, assets / "banner.png"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("target_bytes") != 2_000_000:
+        raise SystemExit(
+            "the rehearsal copy was made for a different target; rerun "
+            "tests/render_preview.py '2 MB' before building catalog assets"
+        )
+    if metadata.get("status") != "fits":
+        raise SystemExit(
+            "the rehearsal did not reach 2 MB; the catalog captions claim it did"
+        )
+    if metadata.get("output_sha256") != engine.sha256_file(compressed):
+        raise SystemExit(
+            "scanned-report-compressed.pdf does not match its metadata (stale or "
+            "edited); rerun tests/render_preview.py '2 MB'"
+        )
+    if metadata.get("source_sha256") != engine.sha256_file(original):
+        raise SystemExit(
+            "scanned-report.pdf changed after the rehearsal; rerun "
+            "scripts/build_demo.sh from scratch"
+        )
 
     inspection = engine.inspect_pdf(original)
     out_size = compressed.stat().st_size
+    page = preview.render_page(original, 0, dpi=110)
+    print(
+        banner(
+            page,
+            assets / "banner.png",
+            engine.human_size(inspection.bytes),
+            engine.human_size(out_size),
+        )
+    )
     print(
         preview.comparison_sheet(
             original,
@@ -121,7 +153,10 @@ def main(argv: list[str]) -> int:
             assets / "screenshot.jpg",
             original_label=engine.human_size(inspection.bytes),
             compressed_label=engine.human_size(out_size),
-            caption=f"{inspection.pages} pages · 88 DPI / JPEG quality 48",
+            caption=(
+                f"{inspection.pages} pages · "
+                f"{metadata.get('quality') or 'no image re-encoded'}"
+            ),
         )
     )
     return 0

@@ -113,13 +113,34 @@ def _plural(count: int, word: str) -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
-def _suggest_target(floor_bytes: int) -> str:
-    """A round number just above the honest floor, for the 'raise it to' hint."""
+def _suggest_target(floor_bytes: int, source_bytes: int) -> str | None:
+    """A reachable round target above the honest floor, or None.
+
+    The number is rendered with the same precision the tool prints sizes at, and
+    then rounded up to that precision so parsing the suggestion back yields at
+    least the floor. A suggestion that displays as "1.13 MB" must not mean
+    1,130,000 bytes when the floor copy is 1,132,128 bytes.
+    """
     engine = _engine()
-    step = 500_000
-    rounded = ((floor_bytes // step) + 1) * step
+    if floor_bytes >= 100_000_000:
+        quantum = 1_000_000
+    elif floor_bytes >= 1_000_000:
+        quantum = 10_000
+    elif floor_bytes >= 1_000:
+        quantum = 10
+    else:
+        quantum = 1
+
+    rounded = ((floor_bytes + quantum - 1) // quantum) * quantum
     if rounded < 1_000_000:
         rounded = 1_000_000
+    try:
+        while engine.parse_size(engine.human_size(rounded)) < floor_bytes:
+            rounded += quantum
+    except ValueError:
+        return None
+    if rounded >= source_bytes:
+        return None
     return engine.human_size(rounded)
 
 
@@ -209,6 +230,11 @@ def pdf_inspect(args: dict, **kwargs) -> str:
                 for record in report.biggest(3)
             ],
         },
+        "reclaimable": {
+            "count": len(report.reclaimable),
+            "bytes": report.reclaimable_bytes,
+            "size": engine.human_size(report.reclaimable_bytes),
+        },
         "seconds": report.elapsed,
     }
 
@@ -244,6 +270,20 @@ def _verdict(engine, report):
         )
 
     if image_share >= 0.6:
+        reclaimable_share = (
+            report.reclaimable_bytes / report.image_bytes if report.image_bytes else 0.0
+        )
+        if reclaimable_share < 0.1:
+            return (
+                "images_not_reclaimable",
+                f"{image_share * 100:.0f}% of this file is {len(report.images)} image(s), "
+                f"but only {human(report.reclaimable_bytes)} is in a form this tool "
+                "can safely re-encode.",
+                "Those images are masked, CMYK, non-8-bit, /Decode or already compressed, "
+                "and PDF Shrink leaves them alone rather than risk corrupting them. "
+                "Re-exporting them as plain RGB/grayscale images would make them "
+                "shrinkable.",
+            )
         dpi_text = (
             f"the largest are around {report.max_dpi} DPI"
             if report.max_dpi >= 150
@@ -355,6 +395,21 @@ def pdf_shrink(args: dict, **kwargs) -> str:
             aggressive=aggressive,
             drop_attachments=drop_attachments,
         )
+    except engine.DestinationExists as exc:
+        return _fail(
+            "destination_exists",
+            f"{exc}. Choose a different output name; nothing was written and "
+            "the original was not written to.",
+            path=str(path),
+            output_path=str(destination) if destination else None,
+        )
+    except engine.SourceOverwrite:
+        return _fail(
+            "bad_request",
+            "The output path is the source file. PDF Shrink never overwrites "
+            "the original — pick another name.",
+            path=str(path),
+        )
     except Exception as exc:  # noqa: BLE001
         name = type(exc).__name__
         if name == "PasswordError" or "password" in str(exc).lower():
@@ -367,17 +422,24 @@ def pdf_shrink(args: dict, **kwargs) -> str:
         if name == "PdfError":
             return _fail(
                 "unreadable",
-                f"{path.name} looks damaged: {exc}. The original is untouched.",
+                f"{path.name} looks damaged: {exc}. PDF Shrink did not write to "
+                "the original.",
                 path=str(path),
             )
         return _fail(
             "failed",
-            f"Shrinking {path.name} failed: {name}: {exc}. The original is untouched.",
+            f"Shrinking {path.name} failed: {name}: {exc}. PDF Shrink did not "
+            "write to the original.",
             path=str(path),
         )
 
     payload = _shrink_payload(engine, result, target_text)
-    if show_preview and result.output and result.output != result.source:
+    if (
+        show_preview
+        and result.verified
+        and result.output
+        and result.output != result.source
+    ):
         payload["preview_image"] = _render_preview(
             engine, result, Path(payload["output"]["path"])
         )
@@ -395,6 +457,33 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
     target = {"text": str(target_text), "bytes": result.target_bytes,
               "size": engine.human_size(result.target_bytes)}
     ladder = [_describe_attempt(engine, attempt) for attempt in result.attempts]
+    inspection = result.inspection
+    dropped = None
+    if result.drop_attachments and inspection is not None and inspection.attachments:
+        dropped = {
+            "count": inspection.attachments,
+            "bytes": inspection.attachment_bytes,
+            "size": engine.human_size(inspection.attachment_bytes),
+        }
+
+    output = None
+    if result.output is not None:
+        output = {
+            "path": str(result.output),
+            "bytes": result.output_bytes,
+            "size": engine.human_size(result.output_bytes),
+            "name": Path(result.output).name,
+            "fits": bool(result.fits),
+        }
+
+    verified = {
+        "reopens": bool(result.verification.get("opens")),
+        "page_count_matches": bool(result.verification.get("pages_equal")),
+        "blank_pages": result.verification.get("blank_pages", 0),
+        "syntax_errors": result.verification.get("syntax_errors", 0),
+        "attachments": result.verification.get("attachments"),
+        "pages": result.verification.get("pages", 0),
+    }
 
     if result.reason == "already_small_enough":
         return {
@@ -412,35 +501,82 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
             ),
         }
 
-    output = None
-    if result.output is not None:
-        output = {
-            "path": str(result.output),
-            "bytes": result.output_bytes,
-            "size": engine.human_size(result.output_bytes),
-            "name": Path(result.output).name,
-            "fits": bool(result.ok),
+    if result.reason == "source_changed":
+        message = (
+            "The source file changed while I was working, so I cannot claim it "
+            "was left untouched."
+        )
+        if output is not None:
+            message += (
+                f" The copy at {output['name']} was built from the original I "
+                "opened at the start; re-check it before using it."
+            )
+        else:
+            message += " No copy was delivered."
+        return {
+            "ok": False,
+            "status": "source_changed",
+            "target": target,
+            "original": original,
+            "output": output,
+            "pages": result.pages,
+            "ladder": ladder,
+            "verified": verified,
+            "seconds": result.seconds,
+            "message": message,
         }
 
-    verified = {
-        "reopens": bool(result.verification.get("opens")),
-        "page_count_matches": bool(result.verification.get("pages_equal")),
-        "blank_pages": result.verification.get("blank_pages", 0),
-        "pages": result.verification.get("pages", 0),
-    }
+    if result.reason == "verification_failed":
+        detail = result.verification.get("error")
+        if not detail and verified["syntax_errors"]:
+            detail = f"{verified['syntax_errors']} structural problem(s)"
+        if not detail and verified["blank_pages"]:
+            detail = f"{verified['blank_pages']} blank page(s)"
+        if not detail and not verified["page_count_matches"]:
+            detail = "the page count did not match"
+        detail = f" ({detail})" if detail else ""
+        if output is not None:
+            message = (
+                f"I wrote {output['size']} to {output['name']}, but it failed the "
+                f"re-open check{detail}. Do not rely on that copy. The original "
+                "is untouched."
+            )
+        else:
+            message = (
+                f"The best copy I built failed the re-open check{detail}, so I did "
+                "not hand it over. The original is untouched."
+            )
+        return {
+            "ok": False,
+            "status": "verification_failed",
+            "target": target,
+            "original": original,
+            "output": output,
+            "pages": result.pages,
+            "ladder": ladder,
+            "verified": verified,
+            "seconds": result.seconds,
+            "message": message,
+        }
 
-    if result.ok:
+    if result.ok and output is not None:
         chosen = result.chosen
-        images = (
-            "no image was re-encoded (structure cleanup only)"
-            if chosen is not None and chosen.preset.lossless
-            else (
+        skipped = chosen.images_skipped if chosen is not None else 0
+        if chosen is not None and chosen.preset.lossless:
+            images = "no image was re-encoded (structure cleanup only)"
+        elif chosen is not None and chosen.images_downsampled == 0:
+            images = "no image needed re-encoding (structure cleanup only)"
+            if skipped:
+                images += f"; {_plural(skipped, 'image')} left alone"
+        elif chosen is not None:
+            images = (
                 f"{_plural(chosen.images_downsampled, 'image')} re-encoded at "
                 f"{chosen.describe()}"
-                if chosen is not None
-                else "no image was re-encoded"
             )
-        )
+            if skipped:
+                images += f", {_plural(skipped, 'image')} left alone"
+        else:
+            images = "no image was re-encoded"
         message = (
             f"{original['size']} → {output['size']} "
             f"({result.saved_percent:.1f}% smaller). Saved as {output['name']}. "
@@ -452,12 +588,18 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
                 f" Re-opened the copy: {verified['pages']} pages, "
                 f"{'none blank' if not blank else str(blank) + ' blank'}."
             )
+        if dropped and verified.get("attachments") == 0:
+            message += (
+                f" Dropped {_plural(dropped['count'], 'embedded attachment')} "
+                f"({dropped['size']})."
+            )
         return {
             "ok": True,
             "status": "fits",
             "target": target,
             "original": original,
             "output": output,
+            "dropped_attachments": dropped,
             "saved": {
                 "bytes": result.saved_bytes,
                 "size": engine.human_size(result.saved_bytes),
@@ -476,9 +618,47 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
             "message": message,
         }
 
-    # Honest miss: the target is out of reach without wrecking the document.
+    # Honest miss.
     floor = result.floor
+    attachments = inspection.attachments if inspection is not None else 0
+    attachment_bytes = inspection.attachment_bytes if inspection is not None else 0
+    reclaimable = inspection.reclaimable_bytes if inspection is not None else 0
+
     if floor is None or output is None:
+        if inspection is not None and inspection.images and reclaimable == 0:
+            reason = (
+                "Nothing here is an image this tool can safely re-encode "
+                "(they are masked, CMYK, non-8-bit, /Decode or already compressed), so "
+                "the file cannot be made smaller without changing what it contains."
+            )
+        elif result.chosen is not None and result.chosen.bytes >= result.source_bytes:
+            reason = (
+                "Every safe setting came out at or above the original size "
+                f"(best: {engine.human_size(result.chosen.bytes)}), so there is "
+                "nothing worth handing over."
+            )
+        elif result.chosen is not None:
+            gain = result.source_bytes - result.chosen.bytes
+            percent = 100.0 * gain / result.source_bytes if result.source_bytes else 0
+            reason = (
+                "The best safe copy is only "
+                f"{engine.human_size(result.chosen.bytes)} "
+                f"({percent:.1f}% smaller), which is not worth writing another "
+                "file for."
+            )
+        else:
+            reason = "No safe setting produced a copy smaller than the original."
+        suggestions = ["Check what is inside with pdf_inspect."]
+        if not result.drop_attachments and attachments and attachment_bytes > 200_000:
+            suggestions.append(
+                f"Drop {_plural(attachments, 'embedded attachment')} "
+                f"({engine.human_size(attachment_bytes)}) with "
+                "drop_attachments=true if losing them is acceptable."
+            )
+        suggestions.append(
+            "If the limit is a hard one, the pages may need to be split or "
+            "re-exported from the source document."
+        )
         return {
             "ok": False,
             "status": "no_gain",
@@ -488,38 +668,69 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
             "pages": result.pages,
             "ladder": ladder,
             "seconds": result.seconds,
-            "message": (
-                f"Nothing safe to remove: {engine.human_size(result.source_bytes)} "
-                "of this file is not re-encodable image data, so shrinking would "
-                "not move the number. The original is untouched."
-            ),
-            "suggestions": [
-                "Check what is inside with pdf_inspect.",
-                "If the limit is a hard one, the pages may need to be split or "
-                "re-exported from the source document.",
-            ],
+            "message": f"{reason} The original is untouched.",
+            "suggestions": suggestions,
         }
 
-    suggested = _suggest_target(result.output_bytes)
-    suggestions = [
-        f"Raise the target to about {suggested} and keep this quality.",
-    ]
-    if not result.aggressive:
+    suggested = _suggest_target(result.output_bytes, result.source_bytes)
+    suggestions = []
+    if suggested:
+        suggestions.append(
+            f"Raise the target to about {suggested} and keep this quality."
+        )
+    aggressive_helps = (
+        not result.aggressive
+        and floor.preset.dpi is not None
+        and floor.preset.name != engine.AGGRESSIVE_LADDER[-1].name
+        and (reclaimable > 0 or floor.images_downsampled > 0)
+    )
+    if aggressive_helps:
         suggestions.append(
             "Call again with aggressive=true to allow 72 DPI (rougher, smaller)."
         )
+    if not result.drop_attachments and attachments and attachment_bytes > 200_000:
+        suggestions.append(
+            f"Drop {_plural(attachments, 'embedded attachment')} "
+            f"({engine.human_size(attachment_bytes)}) with drop_attachments=true "
+            "if losing them is acceptable."
+        )
+    if not suggestions:
+        suggestions.append(
+            "Re-exporting or splitting the pages may be the only way to go lower."
+        )
+
+    if floor.preset.lossless:
+        opening = (
+            f"I could not get this under {target['size']} without changing the "
+            "document."
+        )
+    else:
+        opening = (
+            f"I could not get this under {target['size']} without dropping below "
+            "the quality this run allowed."
+        )
     message = (
-        f"I could not get this under {target['size']} without making it "
-        f"unreadable. The smallest safe copy is {output['size']} "
+        f"{opening} The smallest safe copy is {output['size']} "
         f"({floor.describe()}) — saved as {output['name']}. "
         f"That is {result.saved_percent:.1f}% smaller than the original, which is "
-        f"untouched. To go lower, raise the target to about {suggested}"
+        "untouched."
     )
-    message += (
-        ", or call again with aggressive=true for 72 DPI."
-        if not result.aggressive
-        else "."
-    )
+    if suggested:
+        message += f" To go lower, raise the target to about {suggested}"
+        message += (
+            ", or call again with aggressive=true for 72 DPI."
+            if aggressive_helps
+            else "."
+        )
+    elif aggressive_helps:
+        message += (
+            " To go lower, call again with aggressive=true for 72 DPI."
+        )
+    if dropped and verified.get("attachments") == 0:
+        message += (
+            f" Dropped {_plural(dropped['count'], 'embedded attachment')} "
+            f"({dropped['size']})."
+        )
 
     return {
         "ok": False,
@@ -527,6 +738,7 @@ def _shrink_payload(engine, result, target_text: str) -> dict:
         "target": target,
         "original": original,
         "output": output,
+        "dropped_attachments": dropped,
         "smallest_safe": {
             "size": output["size"],
             "bytes": result.output_bytes,

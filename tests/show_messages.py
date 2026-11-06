@@ -35,6 +35,11 @@ def show(title: str, raw: str) -> None:
 
 
 if __name__ == "__main__":
+    for name in ("demo-out-2mb.pdf", "demo-out-floor.pdf"):
+        try:
+            (DEMO / name).unlink()
+        except FileNotFoundError:
+            pass
     show("inspect · scan", plugin.tools.pdf_inspect({"path": str(DEMO / "scanned-report.pdf")}))
     show(
         "shrink · scan to 2 MB",
