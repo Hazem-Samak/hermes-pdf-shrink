@@ -524,6 +524,103 @@ def test_denylisted_output_location_is_refused(tmp_path, monkeypatch, plugin):
     assert engine.destination_refusal(tmp_path / "fine.pdf") is None
 
 
+def test_output_path_is_refused_before_any_early_return(tmp_path):
+    """Refusal is decided up front, so an early return cannot skip it.
+
+    A target ten times the file size ends in ``already_small_enough`` before the
+    delivery path is ever reached; the bad output_path must still be refused.
+    """
+    source = make_pdf(tmp_path / "scan.pdf", pages=1)
+    target = tmp_path / "notes.txt"
+
+    with pytest.raises(engine.DestinationNotWritable):
+        engine.shrink_to_target(source, source.stat().st_size * 10, destination=target)
+
+    # target_unreachable is the other early return on the delivery path; the
+    # refusal must come first here too, before the ladder is built.
+    with pytest.raises(engine.DestinationNotWritable):
+        engine.shrink_to_target(source, 1_000, destination=target)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["scan.pdf"]
+
+
+def test_denylist_that_cannot_answer_refuses(tmp_path, monkeypatch, plugin):
+    """A denylist that is installed but raises must fail closed, not open."""
+    broken = types.ModuleType("agent.file_safety")
+
+    def explode(value):
+        raise RuntimeError("denylist unavailable")
+
+    broken.is_write_denied = explode
+    package = types.ModuleType("agent")
+    package.file_safety = broken
+    monkeypatch.setitem(sys.modules, "agent", package)
+    monkeypatch.setitem(sys.modules, "agent.file_safety", broken)
+
+    source = make_pdf(tmp_path / "scan.pdf", pages=1)
+    destination = tmp_path / "copy.pdf"
+    assert engine.destination_refusal(destination) is not None
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "500 KB",
+                "output_path": str(destination),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "destination_not_writable"
+    assert not destination.exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["scan.pdf"]
+
+
+def test_uppercase_pdf_extension_is_accepted(tmp_path, plugin):
+    """The suffix rule is case-insensitive: OUT.PDF is a fine output name."""
+    source = make_pdf(tmp_path / "scan.pdf", pages=1)
+    destination = tmp_path / "OUT.PDF"
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": f"{source.stat().st_size // 2}",
+                "output_path": str(destination),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["ok"], payload
+    assert destination.is_file()
+
+
+def test_tool_refuses_bad_name_without_compressing(tmp_path, monkeypatch, plugin):
+    """The tool's early mirror refuses the name before the ladder runs."""
+    source = make_pdf(tmp_path / "scan.pdf", pages=1)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the ladder must not run for a refused output_path")
+
+    monkeypatch.setattr(engine, "shrink_to_target", explode)
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "500 KB",
+                "output_path": str(tmp_path / "notes.txt"),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "destination_not_writable"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["scan.pdf"]
+
+
 def test_existing_destination_is_never_overwritten(tmp_path):
     source = make_pdf(tmp_path / "src.pdf", pages=1)
     target = tmp_path / "existing.pdf"

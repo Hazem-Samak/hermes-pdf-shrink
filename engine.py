@@ -975,6 +975,14 @@ def shrink_to_target(
     if source.suffix.lower() != ".pdf":
         raise ValueError(f"not a .pdf file: {source.name}")
 
+    if destination is not None:
+        # Confinement is decided here, before a file is opened or hashed, so no
+        # early return further down (already small enough, target unreachable,
+        # verification failed) can be a way around the refusal.
+        refusal = destination_refusal(Path(destination).expanduser().resolve())
+        if refusal is not None:
+            raise DestinationNotWritable(refusal)
+
     source_bytes = source.stat().st_size
     source_hash = sha256_file(source)
     inspection = inspection or inspect_pdf(source)
@@ -1176,9 +1184,6 @@ def shrink_to_target(
                     ) from exc
         else:
             destination = Path(destination).expanduser().resolve()
-            refusal = destination_refusal(destination)
-            if refusal is not None:
-                raise DestinationNotWritable(refusal)
             if destination == source:
                 raise SourceOverwrite(
                     "refusing to overwrite the source file; pick another name"
@@ -1283,14 +1288,14 @@ def _should_deliver(fits: bool, chosen_bytes: int, source_bytes: int) -> bool:
     return chosen_bytes * 100 <= source_bytes * 98
 
 
-def destination_refusal(destination: Path) -> str | None:
+def destination_refusal(destination: Path | str) -> str | None:
     """Why an explicit ``output_path`` may not be written to, or ``None``.
 
     The model chooses ``output_path``, so the choice is confined rather than
     trusted: the file name must be a PDF, and the folder must be one Hermes's
-    own file tools would write to. Both are decided before a byte is written,
-    so an unusable name never costs a compression run.
+    own file tools would write to. Both are decided before a byte is written.
     """
+    destination = Path(destination)
     if destination.suffix.lower() != ".pdf":
         return (
             f"{destination} does not end in .pdf; PDF Shrink writes PDF copies "
@@ -1307,21 +1312,26 @@ def destination_refusal(destination: Path) -> str | None:
 def _hermes_write_denied(destination: Path) -> bool:
     """True when Hermes's own write denylist refuses ``destination``.
 
-    Imported lazily and tolerated as missing so the engine still works outside
-    Hermes. A denylist that raises is treated as "no opinion": the O_EXCL
-    create is still the final authority on what actually lands on disk.
+    A missing ``agent.file_safety`` means this is not running inside Hermes
+    (the test suite, a plain CLI), so there is no denylist and the engine
+    carries on. Everything else fails closed: a denylist that is installed but
+    cannot answer counts as a refusal, because this guard is the only thing
+    confining the model's chosen path — ``O_EXCL`` stops overwrites, not
+    location.
     """
     try:
         from agent.file_safety import is_write_denied
-    except Exception:  # noqa: BLE001 — not running inside Hermes
-        return False
+    except ModuleNotFoundError as exc:
+        # No Hermes at all: this is a standalone run (tests, CLI) and there is
+        # no denylist to consult. A module that exists but cannot load its own
+        # imports is a broken install, and that fails closed.
+        return exc.name not in {"agent", "agent.file_safety"}
+    except Exception:  # noqa: BLE001 — a broken install refuses
+        return True
     try:
-        verdict = is_write_denied(str(destination))
-    except Exception:  # noqa: BLE001 — never fail a shrink on the check alone
-        return False
-    if isinstance(verdict, tuple):
-        verdict = verdict[0] if verdict else False
-    return bool(verdict)
+        return bool(is_write_denied(str(destination)))
+    except Exception:  # noqa: BLE001 — a guard that cannot answer refuses
+        return True
 
 
 def _writable_directory(path: Path) -> bool:
