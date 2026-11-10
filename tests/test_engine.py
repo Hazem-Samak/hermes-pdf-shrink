@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import zlib
 from pathlib import Path
 
@@ -459,6 +460,68 @@ def test_unwritable_destination_is_reported(tmp_path, plugin):
     assert payload["status"] == "destination_not_writable"
     assert "output_path" in payload["message"]
     assert list(destination_dir.iterdir()) == []
+
+
+def test_non_pdf_output_path_is_refused(tmp_path, plugin):
+    """The model picks output_path; a non-PDF name is refused, nothing written."""
+    source = make_pdf(tmp_path / "scan.pdf", pages=1)
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "500 KB",
+                "output_path": str(tmp_path / "notes.txt"),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "destination_not_writable"
+    assert ".pdf" in payload["message"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["scan.pdf"]
+
+    with pytest.raises(engine.DestinationNotWritable):
+        engine.shrink_to_target(source, 5_000, destination=tmp_path / "notes.txt")
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["scan.pdf"]
+
+
+def test_denylisted_output_location_is_refused(tmp_path, monkeypatch, plugin):
+    """A folder Hermes's write denylist refuses is refused here too."""
+    source = make_pdf(tmp_path / "scan.pdf", pages=1)
+    denied_dir = tmp_path / "denied"
+    denied_dir.mkdir()
+    denied = denied_dir / "copy.pdf"
+
+    # Stand in for Hermes's agent.file_safety, absent when the engine runs alone.
+    fake = types.ModuleType("agent.file_safety")
+    fake.is_write_denied = lambda value: str(value).startswith(str(denied_dir))
+    package = types.ModuleType("agent")
+    package.file_safety = fake
+    monkeypatch.setitem(sys.modules, "agent", package)
+    monkeypatch.setitem(sys.modules, "agent.file_safety", fake)
+
+    payload = json.loads(
+        plugin.tools.pdf_shrink(
+            {
+                "path": str(source),
+                "target_size": "500 KB",
+                "output_path": str(denied),
+                "show_preview": False,
+            }
+        )
+    )
+
+    assert payload["status"] == "destination_not_writable"
+    assert "does not allow" in payload["message"]
+    assert list(denied_dir.iterdir()) == []
+
+    with pytest.raises(engine.DestinationNotWritable):
+        engine.shrink_to_target(source, 5_000, destination=denied)
+    assert list(denied_dir.iterdir()) == []
+
+    # An ordinary folder is still allowed while the denylist is installed.
+    assert engine.destination_refusal(tmp_path / "fine.pdf") is None
 
 
 def test_existing_destination_is_never_overwritten(tmp_path):

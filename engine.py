@@ -23,7 +23,9 @@ Design notes, kept here so the next reader — human or model — knows why:
   source. A read-only source folder therefore still works, and a failed run
   cannot leave full-size copies next to the user's document.
 
-Pure library on purpose: no Hermes imports, no network, no subprocesses.
+Pure library on purpose: no network, no subprocesses. The only Hermes import is
+the optional ``agent.file_safety`` write denylist, imported lazily inside a
+``try`` so the engine still runs standalone (the test suite, a plain CLI).
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ __all__ = [
     "DestinationExists",
     "SourceOverwrite",
     "DestinationNotWritable",
+    "destination_refusal",
     "human_size",
     "parse_size",
     "inspect_pdf",
@@ -1173,6 +1176,9 @@ def shrink_to_target(
                     ) from exc
         else:
             destination = Path(destination).expanduser().resolve()
+            refusal = destination_refusal(destination)
+            if refusal is not None:
+                raise DestinationNotWritable(refusal)
             if destination == source:
                 raise SourceOverwrite(
                     "refusing to overwrite the source file; pick another name"
@@ -1275,6 +1281,47 @@ def _should_deliver(fits: bool, chosen_bytes: int, source_bytes: int) -> bool:
     if fits:
         return True
     return chosen_bytes * 100 <= source_bytes * 98
+
+
+def destination_refusal(destination: Path) -> str | None:
+    """Why an explicit ``output_path`` may not be written to, or ``None``.
+
+    The model chooses ``output_path``, so the choice is confined rather than
+    trusted: the file name must be a PDF, and the folder must be one Hermes's
+    own file tools would write to. Both are decided before a byte is written,
+    so an unusable name never costs a compression run.
+    """
+    if destination.suffix.lower() != ".pdf":
+        return (
+            f"{destination} does not end in .pdf; PDF Shrink writes PDF copies "
+            "only — pass an output_path ending in .pdf"
+        )
+    if _hermes_write_denied(destination):
+        return (
+            f"{destination} is in a location Hermes does not allow files to be "
+            "written to; pass output_path pointing at a folder you can use"
+        )
+    return None
+
+
+def _hermes_write_denied(destination: Path) -> bool:
+    """True when Hermes's own write denylist refuses ``destination``.
+
+    Imported lazily and tolerated as missing so the engine still works outside
+    Hermes. A denylist that raises is treated as "no opinion": the O_EXCL
+    create is still the final authority on what actually lands on disk.
+    """
+    try:
+        from agent.file_safety import is_write_denied
+    except Exception:  # noqa: BLE001 — not running inside Hermes
+        return False
+    try:
+        verdict = is_write_denied(str(destination))
+    except Exception:  # noqa: BLE001 — never fail a shrink on the check alone
+        return False
+    if isinstance(verdict, tuple):
+        verdict = verdict[0] if verdict else False
+    return bool(verdict)
 
 
 def _writable_directory(path: Path) -> bool:

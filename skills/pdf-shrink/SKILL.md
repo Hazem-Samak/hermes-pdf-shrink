@@ -60,7 +60,9 @@ meaningfully smaller. Say that, not "it failed".
   directory, or to `output_path`. Never suggest overwriting the source. If the
   output path already exists the call returns `status: "destination_exists"`;
   choose a different name, do not retry with the same one. If it returns
-  `"destination_not_writable"`, ask the user for a writable `output_path`.
+  `"destination_not_writable"`, the folder is not writable, the name does not
+  end in `.pdf`, or the location is one Hermes's write denylist refuses — ask
+  the user for a `.pdf` path in a folder they can use.
   Temporary rungs stay in the system temp directory, not beside the PDF.
 - **Quality is chosen by measurement.** The ladder starts at the best setting and
   only gets rougher, rebuilt each time from the pristine original — so the copy

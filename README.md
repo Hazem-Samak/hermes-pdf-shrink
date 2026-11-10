@@ -126,6 +126,11 @@ searchable.
 - **It never overwrites a file.** The default name gets a numeric suffix if it
   already exists; an explicit `output_path` that exists is refused with
   `destination_exists`.
+- **The output name is confined.** An explicit `output_path` must end in `.pdf`,
+  and its folder must be one Hermes's own file tools would write to: the write
+  denylist that keeps the agent out of `.ssh`, credential files and the like is
+  applied here too. Either refusal returns `destination_not_writable` with
+  nothing written.
 - **A read-only source folder is fine.** Temporary rungs live in the system temp
   directory (0700) and are removed on every exit path. The default output tries
   the source folder, then the current working directory; an explicit

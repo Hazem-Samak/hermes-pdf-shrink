@@ -41,7 +41,8 @@ PDF_SHRINK = {
                     "next to the original when that folder is writable, otherwise "
                     "the current working directory; the result reports the real "
                     "path. Must not already exist; the tool refuses to overwrite a "
-                    "file."
+                    "file. Must end in .pdf, and must be a folder Hermes is "
+                    "allowed to write to."
                 ),
             },
             "aggressive": {
