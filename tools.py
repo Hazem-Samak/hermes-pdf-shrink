@@ -390,6 +390,19 @@ def pdf_shrink(args: dict, **kwargs) -> str:
             "overwrites the original — pick another name.",
         )
 
+    if destination is not None:
+        # Same confinement the engine enforces, asked early so a bad name costs
+        # no compression run: it must be a .pdf and a location Hermes writes to.
+        refusal = engine.destination_refusal(destination)
+        if refusal is not None:
+            return _fail(
+                "destination_not_writable",
+                f"{refusal}. Nothing was written and the original was not "
+                "written to.",
+                path=str(path),
+                output_path=str(destination),
+            )
+
     aggressive = bool(args.get("aggressive", False))
     drop_attachments = bool(args.get("drop_attachments", False))
     show_preview = args.get("show_preview", True)
