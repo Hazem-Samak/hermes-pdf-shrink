@@ -86,7 +86,7 @@ Local development:
 ```
 hermes plugins doctor /path/to/pdf-shrink --ci     # structure + contracts
 hermes plugins validate /path/to/pdf-shrink --install-deps   # catalog CI gate
-python -m pytest tests -q                         # 48 tests, no fixtures
+python -m pytest tests -q                         # 54 tests, no fixtures
 scripts/build_demo.sh                             # regenerate demo + catalog assets
 ```
 
